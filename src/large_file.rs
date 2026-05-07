@@ -50,7 +50,7 @@ impl LoadedBuffer {
             LoadedBuffer::Rope(buffer)
         } else {
             let mut buffer = Buffer::new_empty(metrics);
-            buffer.set_text(font_system, text, attrs, shaping, None);
+            buffer.set_text(text, attrs, shaping, None);
             LoadedBuffer::Standard(buffer)
         }
     }
@@ -122,7 +122,7 @@ impl LoadedBuffer {
     /// Set buffer size.
     pub fn set_size(&mut self, font_system: &mut FontSystem, width: Option<f32>, height: Option<f32>) {
         match self {
-            LoadedBuffer::Standard(b) => b.set_size(font_system, width, height),
+            LoadedBuffer::Standard(b) => b.set_size(width, height),
             LoadedBuffer::Rope(b) => b.set_size(font_system, width, height),
         }
     }

@@ -761,7 +761,7 @@ impl RopeBuffer {
     /// * `end_line` - Line after the last line to include
     pub fn to_buffer_range(
         &self,
-        font_system: &mut FontSystem,
+        _font_system: &mut FontSystem,
         metrics: Metrics,
         start_line: usize,
         end_line: usize,
@@ -787,7 +787,7 @@ impl RopeBuffer {
         }
 
         // Copy other settings
-        buffer.set_size(font_system, self.width_opt, self.height_opt);
+        buffer.set_size(self.width_opt, self.height_opt);
 
         // Adjust scroll to be relative to the window
         let mut scroll = self.scroll;
