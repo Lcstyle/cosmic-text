@@ -208,6 +208,11 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
         self.editor.update_theme(theme_name)
     }
 
+    /// Set syntax highlighting by file extension (also clears the syntax cache).
+    pub fn syntax_by_extension(&mut self, extension: &str) {
+        self.editor.syntax_by_extension(extension);
+    }
+
     /// Load text from a file, and also set syntax to the best option
     ///
     /// ## Errors
