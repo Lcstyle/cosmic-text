@@ -153,6 +153,13 @@ impl<'syntax_system, 'buffer> SyntaxEditor<'syntax_system, 'buffer> {
         Ok(())
     }
 
+    /// Set cursor position without flagging a cursor-driven reshape.
+    ///
+    /// Delegates to [`Editor::set_cursor_no_reshape`].
+    pub fn set_cursor_no_reshape(&mut self, cursor: Cursor) {
+        self.editor.set_cursor_no_reshape(cursor);
+    }
+
     /// Set syntax highlighting by file extension
     pub fn syntax_by_extension(&mut self, extension: &str) {
         self.syntax = match self

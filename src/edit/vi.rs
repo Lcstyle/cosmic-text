@@ -213,6 +213,15 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
         self.editor.syntax_by_extension(extension);
     }
 
+    /// Set cursor position without flagging a cursor-driven reshape.
+    ///
+    /// Delegates to [`SyntaxEditor::set_cursor_no_reshape`]. Use this when
+    /// restoring a saved cursor position on a freshly loaded buffer where the
+    /// cursor-aware shape path would interfere with the first render.
+    pub fn set_cursor_no_reshape(&mut self, cursor: Cursor) {
+        self.editor.set_cursor_no_reshape(cursor);
+    }
+
     /// Load text from a file, and also set syntax to the best option
     ///
     /// ## Errors

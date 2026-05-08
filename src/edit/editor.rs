@@ -168,6 +168,22 @@ impl<'buffer> Editor<'buffer> {
             }
         });
     }
+
+    /// Set the cursor position without flagging a cursor-driven reshape.
+    ///
+    /// Unlike [`Edit::set_cursor`] this does NOT set the internal `cursor_moved`
+    /// flag, so the next call to [`Edit::shape_as_needed`] still routes through
+    /// [`crate::Buffer::shape_until_scroll`] rather than `shape_until_cursor`.
+    /// Useful for restoring a saved cursor position on a freshly loaded buffer
+    /// where the cursor-aware shape path is undesirable (e.g. some external
+    /// renderers refuse to draw glyphs from a buffer first shaped via
+    /// `shape_until_cursor` on a freshly populated, never-laid-out buffer).
+    pub fn set_cursor_no_reshape(&mut self, cursor: Cursor) {
+        if self.cursor != cursor {
+            self.cursor = cursor;
+            self.with_buffer_mut(|buffer| buffer.set_redraw(true));
+        }
+    }
 }
 
 impl<'buffer> Edit<'buffer> for Editor<'buffer> {
