@@ -32,6 +32,28 @@ fn cursor_position(cursor: &Cursor, run: &LayoutRun) -> Option<(i32, i32)> {
     Some((x as i32, run.line_top as i32))
 }
 
+/// Normalize a block selection's two corner cursors into a row range and a
+/// byte-column range. Columns are measured as byte indices and applied to every
+/// row independently (clamped per-row by [`block_clamp_col`]).
+pub(crate) fn block_corners(anchor: Cursor, cursor: Cursor) -> (usize, usize, usize, usize) {
+    let start_line = cmp::min(anchor.line, cursor.line);
+    let end_line = cmp::max(anchor.line, cursor.line);
+    let left = cmp::min(anchor.index, cursor.index);
+    let right = cmp::max(anchor.index, cursor.index);
+    (start_line, end_line, left, right)
+}
+
+/// Clamp a byte column to a valid char boundary within `text` (floored, never
+/// past the end). Block columns come from cursors on other rows, so they may
+/// land mid-char or beyond the end of a shorter row.
+pub(crate) fn block_clamp_col(text: &str, col: usize) -> usize {
+    let mut c = cmp::min(col, text.len());
+    while c > 0 && !text.is_char_boundary(c) {
+        c -= 1;
+    }
+    c
+}
+
 impl<'buffer> Editor<'buffer> {
     /// Create a new [`Editor`] with the provided [`Buffer`]
     pub fn new(buffer: impl Into<BufferRef<'buffer>>) -> Self {
@@ -91,6 +113,12 @@ impl<'buffer> Editor<'buffer> {
         selected_text_color: Color,
     ) {
         let selection_bounds = self.selection_bounds();
+        // For block selection, highlight each row's column span independently
+        // rather than the linear bounding box.
+        let block_corners_opt = match self.selection() {
+            Selection::Block(anchor) => Some(block_corners(anchor, self.cursor)),
+            _ => None,
+        };
         self.with_buffer(|buffer| {
             for run in buffer.layout_runs() {
                 let line_i = run.line_i;
@@ -98,8 +126,23 @@ impl<'buffer> Editor<'buffer> {
                 let line_top = run.line_top;
                 let line_height = run.line_height;
 
+                // The selection range to paint on this run. For a block selection
+                // it is this row's clamped column span; otherwise the global bounds.
+                let line_bounds = match block_corners_opt {
+                    Some((start_line, end_line, left, right))
+                        if line_i >= start_line && line_i <= end_line =>
+                    {
+                        let text = buffer.lines[line_i].text();
+                        let l = block_clamp_col(text, left);
+                        let r = cmp::max(l, block_clamp_col(text, right));
+                        Some((Cursor::new(line_i, l), Cursor::new(line_i, r)))
+                    }
+                    Some(_) => None,
+                    None => selection_bounds,
+                };
+
                 // Highlight selection
-                if let Some((start, end)) = selection_bounds {
+                if let Some((start, end)) = line_bounds {
                     if line_i >= start.line && line_i <= end.line {
                         let highlights: Vec<(f32, f32)> = run.highlight(start, end).collect();
 
@@ -152,7 +195,7 @@ impl<'buffer> Editor<'buffer> {
 
                     let mut glyph_color = glyph.color_opt.map_or(text_color, |some| some);
                     if text_color != selected_text_color {
-                        if let Some((start, end)) = selection_bounds {
+                        if let Some((start, end)) = line_bounds {
                             if line_i >= start.line
                                 && line_i <= end.line
                                 && (start.line != line_i || glyph.end > start.index)
@@ -449,6 +492,24 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn copy_selection(&self) -> Option<String> {
+        if let Selection::Block(anchor) = self.selection {
+            let cursor = self.cursor;
+            return self.with_buffer(|buffer| {
+                let (start_line, end_line, left, right) = block_corners(anchor, cursor);
+                let mut selection = String::new();
+                for line_i in start_line..=end_line {
+                    if line_i > start_line {
+                        selection.push('\n');
+                    }
+                    let text = buffer.lines[line_i].text();
+                    let l = block_clamp_col(text, left);
+                    let r = cmp::max(l, block_clamp_col(text, right));
+                    selection.push_str(&text[l..r]);
+                }
+                Some(selection)
+            });
+        }
+
         let (start, end) = self.selection_bounds()?;
         self.with_buffer(|buffer| {
             let mut selection = String::new();
@@ -480,6 +541,33 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn delete_selection(&mut self) -> bool {
+        if let Selection::Block(anchor) = self.selection {
+            let cursor = self.cursor;
+            let (start_line, end_line, left, right) = block_corners(anchor, cursor);
+
+            // Delete each row's column range. Each delete is confined to a single
+            // line, so it does not shift the byte indices of the other rows.
+            for line_i in start_line..=end_line {
+                let (l, r) = self.with_buffer(|buffer| {
+                    let text = buffer.lines[line_i].text();
+                    let l = block_clamp_col(text, left);
+                    let r = cmp::max(l, block_clamp_col(text, right));
+                    (l, r)
+                });
+                if r > l {
+                    self.delete_range(Cursor::new(line_i, l), Cursor::new(line_i, r));
+                }
+            }
+
+            // Collapse cursor to the top-left corner and clear the selection.
+            let start_col = self.with_buffer(|buffer| {
+                block_clamp_col(buffer.lines[start_line].text(), left)
+            });
+            self.cursor = Cursor::new(start_line, start_col);
+            self.selection = Selection::None;
+            return true;
+        }
+
         let Some((start, end)) = self.selection_bounds() else {
             return false;
         };
@@ -713,7 +801,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                         Selection::None => {}
                         Selection::Normal(ref mut select)
                         | Selection::Line(ref mut select)
-                        | Selection::Word(ref mut select) => {
+                        | Selection::Word(ref mut select)
+                        | Selection::Block(ref mut select) => {
                             if select.line == line_i && select.index >= after_whitespace {
                                 select.index += required_indent;
                             }
@@ -773,7 +862,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                         Selection::None => {}
                         Selection::Normal(ref mut select)
                         | Selection::Line(ref mut select)
-                        | Selection::Word(ref mut select) => {
+                        | Selection::Word(ref mut select)
+                        | Selection::Block(ref mut select) => {
                             if select.line == line_i && select.index > last_indent {
                                 select.index -= after_whitespace - last_indent;
                             }

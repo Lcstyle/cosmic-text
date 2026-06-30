@@ -147,7 +147,9 @@ pub enum Selection {
     Line(Cursor),
     /// Select by words
     Word(Cursor),
-    //TODO: Select block
+    /// Select a rectangular block (column selection). The stored [`Cursor`] is the
+    /// anchor corner; the editor's live cursor is the opposite corner.
+    Block(Cursor),
 }
 
 /// A trait to allow easy replacements of [`Editor`], like `SyntaxEditor`
@@ -277,6 +279,15 @@ pub trait Edit<'buffer> {
                     }
 
                     Some((start, end))
+                }
+                Selection::Block(select) => {
+                    // Bounding box of the rectangle. Copy/delete special-case Block
+                    // before reaching here; this keeps cursor positioning sensible.
+                    let start_line = cmp::min(select.line, cursor.line);
+                    let end_line = cmp::max(select.line, cursor.line);
+                    let left = cmp::min(select.index, cursor.index);
+                    let right = cmp::max(select.index, cursor.index);
+                    Some((Cursor::new(start_line, left), Cursor::new(end_line, right)))
                 }
             }
         })

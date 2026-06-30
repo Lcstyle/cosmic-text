@@ -346,6 +346,14 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
         let foreground_color = self.foreground_color();
         let cursor_color = self.cursor_color();
         let selection_color = self.selection_color();
+        // For block selection, highlight each row's column span independently
+        // rather than the linear bounding box.
+        let block_corners_opt = match self.selection() {
+            Selection::Block(anchor) => {
+                Some(super::editor::block_corners(anchor, self.cursor()))
+            }
+            _ => None,
+        };
         self.with_buffer(|buffer| {
             let size = buffer.size();
             if let Some(width) = size.0 {
@@ -397,8 +405,21 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
                     None
                 };
 
-                // Highlight selection
-                if let Some((start, end)) = self.selection_bounds() {
+                // Highlight selection. For a block selection this is the row's
+                // clamped column span; otherwise the global linear bounds.
+                let line_bounds = match block_corners_opt {
+                    Some((start_line, end_line, left, right))
+                        if line_i >= start_line && line_i <= end_line =>
+                    {
+                        let text = buffer.lines[line_i].text();
+                        let l = super::editor::block_clamp_col(text, left);
+                        let r = cmp::max(l, super::editor::block_clamp_col(text, right));
+                        Some((Cursor::new(line_i, l), Cursor::new(line_i, r)))
+                    }
+                    Some(_) => None,
+                    None => self.selection_bounds(),
+                };
+                if let Some((start, end)) = line_bounds {
                     if line_i >= start.line && line_i <= end.line {
                         let mut range_opt = None;
                         for glyph in run.glyphs.iter() {
@@ -723,7 +744,10 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             editor.insert_string(data, None);
                         } else {
                             match selection {
-                                Selection::None | Selection::Normal(_) | Selection::Word(_) => {
+                                Selection::None
+                                | Selection::Normal(_)
+                                | Selection::Word(_)
+                                | Selection::Block(_) => {
                                     let mut cursor = editor.cursor();
                                     if after {
                                         editor.with_buffer(|buffer| {
