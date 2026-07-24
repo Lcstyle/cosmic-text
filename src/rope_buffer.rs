@@ -18,8 +18,8 @@ use core_maths::CoreFloat;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    Affinity, Align, Attrs, BorrowedWithFontSystem, BufferLine, Color, Cursor, Ellipsize,
-    FontSystem, Hinting, LayoutCursor, LayoutGlyph, LayoutLine, LineCache, LineEnding,
+    Affinity, Align, Attrs, BorrowedWithFontSystem, BufferLine, Color, Cursor, Direction,
+    Ellipsize, FontSystem, Hinting, LayoutCursor, LayoutGlyph, LayoutLine, LineCache, LineEnding,
     LineView, Metrics, Motion, Renderer, RopeText, Scroll, ShapeLine, Shaping,
     SparseMetadata, Wrap,
 };
@@ -425,7 +425,14 @@ impl RopeBuffer {
             let shaping = self.metadata.shaping(line_i);
 
             let mut shape_line = ShapeLine::empty();
-            shape_line.build(font_system, &text, &attrs_list, shaping, self.tab_width);
+            shape_line.build(
+                font_system,
+                &text,
+                &attrs_list,
+                shaping,
+                self.tab_width,
+                Direction::default(),
+            );
             self.cache.shape.insert(line_i, shape_line);
             self.cache.layout.remove(line_i);
         }

@@ -12,7 +12,7 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use std::borrow::Cow;
 
 use crate::{
-    Align, AttrsList, Ellipsize, FontSystem, Hinting, LayoutLine, LineEnding, ShapeLine, Shaping, Wrap,
+    Align, AttrsList, Direction, Ellipsize, FontSystem, Hinting, LayoutLine, LineEnding, ShapeLine, Shaping, Wrap,
 };
 
 use crate::{LineCache, RopeText, SparseMetadata};
@@ -263,7 +263,14 @@ impl<'a> LineViewMut<'a> {
             let shaping = self.shaping();
 
             let mut shape_line = ShapeLine::empty();
-            shape_line.build(font_system, &text, &attrs_list, shaping, self.tab_width);
+            shape_line.build(
+                font_system,
+                &text,
+                &attrs_list,
+                shaping,
+                self.tab_width,
+                Direction::default(),
+            );
             self.cache.shape.insert(self.line_idx, shape_line);
             self.cache.layout.remove(self.line_idx);
         }
