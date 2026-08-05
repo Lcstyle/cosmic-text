@@ -681,6 +681,34 @@ impl Buffer {
         }
     }
 
+    /// Reset shaping, layout, and metadata caches for every line, forcing a
+    /// full reshape on the next shaping pass. For use when the font
+    /// environment changed out from under the buffer (for example, a
+    /// different monospace font family was configured); text and attributes
+    /// are untouched.
+    ///
+    /// Works over both storage arms: the full arm resets each line in place,
+    /// the rope arm drops the store's shape/layout caches (rope lines hold
+    /// no shaping state of their own).
+    pub fn reset_shaping(&mut self) {
+        match &mut self.store {
+            LineStore::Full(lines) => {
+                for line in lines.iter_mut() {
+                    line.reset();
+                }
+            }
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => {
+                store.cache.clear();
+            }
+        }
+        // Like set_text: everything is cold and the next pass must shape
+        // from scratch. The rope arm of resolve_dirty never scans lines, so
+        // without a dirty flag the reshape would not happen at all.
+        self.dirty |= DirtyFlags::TEXT_SET;
+        self.redraw = true;
+    }
+
     /// Get the text of a line by index.
     ///
     /// For rope-backed buffers this is warm-only (see [`Buffer::line`]);
@@ -2354,5 +2382,54 @@ mod rope_arm_tests {
             editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
             Some("line 500 padding padding".to_string())
         );
+    }
+
+    #[test]
+    fn reset_shaping_reshapes_rope_at_absolute_scroll() {
+        let mut font_system = FontSystem::new();
+        let mut buffer = rope_buffer(10_000);
+        let mut scroll = buffer.scroll();
+        scroll.line = 7_000;
+        buffer.set_scroll(scroll);
+        buffer.shape_until_scroll(&mut font_system, false);
+        assert!(buffer.layout_runs().next().is_some());
+
+        // The font-change path (cosmic-edit's DefaultFont): drop all shaping
+        // state, then the next shape pass must rebuild — not early-return on
+        // clean dirty flags and render nothing.
+        buffer.reset_shaping();
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let runs: Vec<usize> = buffer.layout_runs().map(|run| run.line_i).collect();
+        assert!(
+            !runs.is_empty(),
+            "reset_shaping must leave the buffer reshapeable"
+        );
+        assert_eq!(runs[0], 7_000, "absolute coordinates survive the reset");
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod reset_shaping_full_tests {
+    use super::{Buffer, Metrics};
+    use crate::{Attrs, FontSystem, Shaping};
+
+    #[test]
+    fn reset_shaping_resets_full_lines_and_reshapes() {
+        let mut font_system = FontSystem::new();
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 20.0));
+        buffer.set_size(Some(800.0), Some(600.0));
+        buffer.set_text("alpha\nbeta\ngamma", &Attrs::new(), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut font_system, false);
+        assert!(buffer.line(0).expect("line 0").shape_opt().is_some());
+        buffer.line_mut(1).expect("line 1").set_metadata(7);
+
+        buffer.reset_shaping();
+
+        assert!(buffer.line(0).expect("line 0").shape_opt().is_none());
+        assert_eq!(buffer.line(1).expect("line 1").metadata(), None);
+
+        buffer.shape_until_scroll(&mut font_system, false);
+        assert_eq!(buffer.layout_runs().count(), 3);
     }
 }
