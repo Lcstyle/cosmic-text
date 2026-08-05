@@ -25,7 +25,7 @@ fn layout(c: &mut Criterion) {
             buffer.set_wrap(*wrap);
 
             let mut run_on_text = |text: &str| {
-                buffer.lines.clear();
+                buffer.clear_lines();
                 buffer.set_text(text, &ct::Attrs::new(), *shape, None);
                 buffer.shape_until_scroll(&mut fs, false);
             };

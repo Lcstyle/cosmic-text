@@ -153,7 +153,7 @@ fn main() {
                         });
 
                         let start_line = start_line_opt.unwrap_or(end_line);
-                        let lines = editor.with_buffer(|buffer| buffer.lines.len());
+                        let lines = editor.with_buffer(|buffer| buffer.line_count());
                         let start_y = (start_line * height as usize) / lines;
                         let end_y = (end_line * height as usize) / lines;
                         paint.set_color_rgba8(0xFF, 0xFF, 0xFF, 0x40);
@@ -254,7 +254,7 @@ fn main() {
                                         "s" => {
                                             let mut text = String::new();
                                             editor.with_buffer(|buffer| {
-                                                for line in buffer.lines.iter() {
+                                                for line in buffer.lines_iter() {
                                                     text.push_str(line.text());
                                                     text.push_str(line.ending().as_str());
                                                 }

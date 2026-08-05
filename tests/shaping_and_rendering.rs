@@ -90,7 +90,7 @@ fn test_ligature_segmentation() {
     buffer.set_text("|>", &Attrs::new(), Shaping::Advanced, None);
     let _ = buffer.layout_runs();
 
-    let line = &buffer.lines[0];
+    let line = buffer.line(0).expect("line 0 in bounds");
     let shape = line.shape_opt().expect("ShapeLine not found");
     let span = &shape.spans[0];
 
@@ -106,7 +106,7 @@ fn test_ligature_segmentation() {
     // Test -> (Arrow), which is a common ligature.
     buffer.set_text("->", &Attrs::new(), Shaping::Advanced, None);
     let _ = buffer.layout_runs();
-    let line = &buffer.lines[0];
+    let line = buffer.line(0).expect("line 0 in bounds");
     let shape = line.shape_opt().expect("ShapeLine not found");
 
     assert_eq!(
@@ -119,7 +119,7 @@ fn test_ligature_segmentation() {
     // Test !=
     buffer.set_text("!=", &Attrs::new(), Shaping::Advanced, None);
     let _ = buffer.layout_runs();
-    let line = &buffer.lines[0];
+    let line = buffer.line(0).expect("line 0 in bounds");
     let shape = line.shape_opt().expect("ShapeLine not found");
     // Inter has a contextual alternate for != too.
     assert_eq!(
@@ -132,7 +132,7 @@ fn test_ligature_segmentation() {
     // Test ++
     buffer.set_text("++", &Attrs::new(), Shaping::Advanced, None);
     let _ = buffer.layout_runs();
-    let line = &buffer.lines[0];
+    let line = buffer.line(0).expect("line 0 in bounds");
     let shape = line.shape_opt().expect("ShapeLine not found");
     // Inter does not have a ++ ligature.
     assert_eq!(

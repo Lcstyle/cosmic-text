@@ -16,7 +16,7 @@ fn block_editor(text: &str) -> Editor<'static> {
 fn buffer_text(editor: &Editor<'static>) -> String {
     let mut out = String::new();
     editor.with_buffer(|buffer| {
-        for line in buffer.lines.iter() {
+        for line in buffer.lines_iter() {
             out.push_str(line.text());
             out.push('\n');
         }

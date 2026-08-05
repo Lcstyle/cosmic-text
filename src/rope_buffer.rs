@@ -790,7 +790,7 @@ impl RopeBuffer {
             if let Some(align) = self.metadata.align(line_i) {
                 line.set_align(Some(align));
             }
-            buffer.lines.push(line);
+            buffer.push_line(line);
         }
 
         // Copy other settings
@@ -831,7 +831,7 @@ impl RopeBuffer {
 
         // Build text from buffer lines
         let mut text = String::new();
-        for (i, line) in buffer.lines.iter().enumerate() {
+        for (i, line) in buffer.lines_iter().enumerate() {
             if i > 0 {
                 text.push('\n');
             }
@@ -840,7 +840,7 @@ impl RopeBuffer {
         rope_buffer.text = RopeText::from_str(&text);
 
         // Copy metadata
-        for (i, line) in buffer.lines.iter().enumerate() {
+        for (i, line) in buffer.lines_iter().enumerate() {
             let ending = line.ending();
             if ending != LineEnding::None {
                 rope_buffer.metadata.set_line_ending(i, ending);

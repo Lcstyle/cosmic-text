@@ -27,7 +27,7 @@ fn editor() -> ViEditor<'static, 'static> {
 fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
     let mut text = String::new();
     editor.with_buffer(|buffer| {
-        for line in buffer.lines.iter() {
+        for line in buffer.lines_iter() {
             text.push_str(line.text());
             text.push_str(line.ending().as_str());
         }
