@@ -154,19 +154,14 @@ pub use self::line_cache::*;
 mod line_cache;
 
 #[cfg(feature = "rope-buffer")]
-pub use self::line_view::*;
+pub use self::rope_store::*;
 #[cfg(feature = "rope-buffer")]
-mod line_view;
+mod rope_store;
 
 #[cfg(feature = "rope-buffer")]
 pub use self::rope_buffer::*;
 #[cfg(feature = "rope-buffer")]
 mod rope_buffer;
-
-#[cfg(feature = "rope-buffer")]
-pub use self::large_file::*;
-#[cfg(feature = "rope-buffer")]
-mod large_file;
 
 mod math;
 

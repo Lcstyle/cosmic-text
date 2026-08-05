@@ -50,6 +50,22 @@ impl RopeText {
         }
     }
 
+    /// Create a `RopeText` by streaming from a reader (e.g. a file).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading fails or the data is not valid UTF-8,
+    /// like `read_to_string`.
+    #[cfg(feature = "std")]
+    pub fn from_reader<R: std::io::Read>(reader: R) -> std::io::Result<Self> {
+        let rope = Rope::from_reader(reader)?;
+        let line_count = rope.len_lines();
+        Ok(Self {
+            rope,
+            line_endings: vec![None; line_count],
+        })
+    }
+
     /// Get the number of lines in the text.
     #[inline]
     pub fn line_count(&self) -> usize {

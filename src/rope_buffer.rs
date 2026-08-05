@@ -20,8 +20,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     Affinity, Align, Attrs, BorrowedWithFontSystem, BufferLine, Color, Cursor, Direction,
     Ellipsize, FontSystem, Hinting, LayoutCursor, LayoutGlyph, LayoutLine, LineCache, LineEnding,
-    LineView, Metrics, Motion, Renderer, RopeText, Scroll, ShapeLine, Shaping,
-    SparseMetadata, Wrap,
+    Metrics, Motion, Renderer, RopeText, Scroll, ShapeLine, Shaping, SparseMetadata, Wrap,
 };
 
 /// A line of visible text for rendering (rope-based version)
@@ -153,15 +152,6 @@ impl RopeBuffer {
     #[inline]
     pub fn line_count(&self) -> usize {
         self.text.line_count().max(1)
-    }
-
-    /// Get a line view by index.
-    pub fn line(&self, line_i: usize) -> Option<LineView<'_>> {
-        if line_i < self.line_count() {
-            Some(LineView::new(line_i, &self.text, &self.metadata, &self.cache))
-        } else {
-            None
-        }
     }
 
     /// Get the text of a line.
