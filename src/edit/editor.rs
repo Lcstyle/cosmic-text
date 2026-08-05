@@ -288,6 +288,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn delete_range(&mut self, start: Cursor, end: Cursor) {
+        if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
+            log::warn!("edit rejected: buffer exceeds the thaw cap");
+            return;
+        }
         let change_item = self.with_buffer_mut(|buffer| {
             // Collect removed data for change tracking
             let mut change_lines = Vec::new();
@@ -374,6 +378,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
         data: &str,
         attrs_list: Option<AttrsList>,
     ) -> Cursor {
+        if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
+            log::warn!("edit rejected: buffer exceeds the thaw cap");
+            return cursor;
+        }
         let mut remaining_split_len = data.len();
         if remaining_split_len == 0 {
             return cursor;
@@ -594,6 +602,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn apply_change(&mut self, change: &Change) -> bool {
+        if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
+            log::warn!("edit rejected: buffer exceeds the thaw cap");
+            return false;
+        }
         // Cannot apply changes if there is a pending change
         if let Some(pending) = self.change.take() {
             if !pending.items.is_empty() {

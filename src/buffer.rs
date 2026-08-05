@@ -416,6 +416,8 @@ pub struct Buffer {
     direction: Direction,
     /// Dirty flags tracking which properties changed since last layout
     dirty: DirtyFlags,
+    /// Cap on rope-store size for thaw-on-write; see [`Buffer::ensure_editable`]
+    max_thaw_bytes: Option<usize>,
 }
 
 impl Clone for Buffer {
@@ -439,6 +441,7 @@ impl Clone for Buffer {
             hinting: self.hinting,
             direction: self.direction,
             dirty: self.dirty,
+            max_thaw_bytes: self.max_thaw_bytes,
         }
     }
 }
@@ -471,6 +474,7 @@ impl Buffer {
             hinting: Hinting::default(),
             direction: Direction::default(),
             dirty: DirtyFlags::empty(),
+            max_thaw_bytes: Some(1 << 30),
         }
     }
 
@@ -516,6 +520,44 @@ impl Buffer {
             #[cfg(feature = "rope-buffer")]
             LineStore::Rope(_) => true,
         }
+    }
+
+    /// Set the maximum rope-store size, in bytes, that [`Buffer::ensure_editable`]
+    /// will thaw into a full line vector. `None` removes the cap. Defaults to
+    /// 1 GiB.
+    pub fn set_max_thaw_bytes(&mut self, max: Option<usize>) {
+        self.max_thaw_bytes = max;
+    }
+
+    /// Make the buffer mutable. A rope-backed buffer is thawed into a full
+    /// line vector (measured: ~317 ms + ~1.1 GB RSS for a 236 MB file on the
+    /// reference machine — a one-time cost on first edit). Returns false if
+    /// the store exceeds the thaw cap; the caller must treat the buffer as
+    /// read-only in that case.
+    pub fn ensure_editable(&mut self) -> bool {
+        #[cfg(feature = "rope-buffer")]
+        {
+            // Borrow-check friendly: inspect first, replace after the borrow ends.
+            let over_cap = match &self.store {
+                LineStore::Rope(store) => match self.max_thaw_bytes {
+                    Some(max) => store.text_len_bytes() > max,
+                    None => false,
+                },
+                LineStore::Full(_) => return true,
+            };
+            if over_cap {
+                return false;
+            }
+            let old = core::mem::replace(&mut self.store, LineStore::Full(Vec::new()));
+            if let LineStore::Rope(store) = old {
+                self.store = LineStore::Full(store.thaw());
+            } else {
+                self.store = old; // unreachable in practice; restore defensively
+            }
+            return true;
+        }
+        #[cfg(not(feature = "rope-buffer"))]
+        true
     }
 
     /// Number of lines in the buffer.
@@ -2200,7 +2242,7 @@ impl BorrowedWithFontSystem<'_, Buffer> {
 #[cfg(all(test, feature = "rope-buffer", feature = "std"))]
 mod rope_arm_tests {
     use super::{Buffer, Metrics};
-    use crate::{Attrs, FontSystem, RopeStore, Shaping};
+    use crate::{Attrs, Cursor, Edit, Editor, FontSystem, RopeStore, Shaping};
 
     fn rope_buffer(lines: usize) -> Buffer {
         let text: String = (0..lines)
@@ -2273,5 +2315,44 @@ mod rope_arm_tests {
 
         let cursor = buffer.hit(10.0, 10.0).expect("hit inside shaped region");
         assert!(cursor.line >= 7_000, "hit cursor line {}", cursor.line);
+    }
+
+    #[test]
+    fn thaw_on_first_edit() {
+        let buffer = rope_buffer(1_000);
+        assert!(buffer.is_rope());
+        let mut editor = Editor::new(buffer);
+
+        editor.insert_at(Cursor::new(500, 0), "hello ", None);
+
+        assert!(
+            !editor.with_buffer(|buffer| buffer.is_rope()),
+            "first edit must thaw the rope store into a full one"
+        );
+        assert_eq!(
+            editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
+            Some("hello line 500 padding padding".to_string())
+        );
+        // No newline inserted: line count is unchanged (1000 lines + trailing empty).
+        assert_eq!(editor.with_buffer(super::Buffer::line_count), 1_001);
+    }
+
+    #[test]
+    fn thaw_cap_refuses_edit() {
+        let mut buffer = rope_buffer(1_000);
+        buffer.set_max_thaw_bytes(Some(10));
+        let mut editor = Editor::new(buffer);
+
+        let cursor = editor.insert_at(Cursor::new(500, 0), "hello ", None);
+
+        assert_eq!(cursor, Cursor::new(500, 0), "rejected edit must be a no-op");
+        assert!(
+            editor.with_buffer(|buffer| buffer.is_rope()),
+            "over-cap buffer must stay rope-backed"
+        );
+        assert_eq!(
+            editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
+            Some("line 500 padding padding".to_string())
+        );
     }
 }
