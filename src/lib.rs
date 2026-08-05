@@ -158,11 +158,6 @@ pub use self::rope_store::*;
 #[cfg(feature = "rope-buffer")]
 mod rope_store;
 
-#[cfg(feature = "rope-buffer")]
-pub use self::rope_buffer::*;
-#[cfg(feature = "rope-buffer")]
-mod rope_buffer;
-
 mod math;
 
 type BuildHasher = core::hash::BuildHasherDefault<rustc_hash::FxHasher>;
