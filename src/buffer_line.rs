@@ -121,6 +121,11 @@ impl BufferLine {
         &self.attrs_list
     }
 
+    /// Get the shaping strategy used for this line
+    pub const fn shaping(&self) -> Shaping {
+        self.shaping
+    }
+
     /// Set attributes list
     ///
     /// Will reset shape and layout if it differs from current attributes list.

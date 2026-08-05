@@ -37,6 +37,21 @@ pub struct RopeStore {
     materialized: LruCache<usize, BufferLine>,
 }
 
+impl Clone for RopeStore {
+    /// Clones share the rope and metadata cheaply; the shape/layout and
+    /// materialized-line caches start cold.
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            metadata: self.metadata.clone(),
+            cache: LineCache::default(),
+            materialized: LruCache::new(
+                NonZeroUsize::new(MATERIALIZED_CAPACITY).expect("capacity must be > 0"),
+            ),
+        }
+    }
+}
+
 impl RopeStore {
     fn with_text(text: RopeText, attrs: &Attrs, shaping: Shaping) -> Self {
         let mut metadata = SparseMetadata::new();

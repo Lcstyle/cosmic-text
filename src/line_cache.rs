@@ -50,6 +50,11 @@ impl ShapeCache {
         self.cache.get_mut(&line_idx)
     }
 
+    /// Get a shaped line without updating LRU order (shared access).
+    pub fn peek(&self, line_idx: usize) -> Option<&ShapeLine> {
+        self.cache.peek(&line_idx)
+    }
+
     /// Check if a line is in the cache without updating LRU order.
     pub fn contains(&self, line_idx: usize) -> bool {
         self.cache.contains(&line_idx)
@@ -166,6 +171,11 @@ impl LayoutCache {
     /// Get a mutable reference to a laid out line from the cache.
     pub fn get_mut(&mut self, line_idx: usize) -> Option<&mut Vec<LayoutLine>> {
         self.cache.get_mut(&line_idx)
+    }
+
+    /// Get a laid out line without updating LRU order (shared access).
+    pub fn peek(&self, line_idx: usize) -> Option<&Vec<LayoutLine>> {
+        self.cache.peek(&line_idx)
     }
 
     /// Check if a line is in the cache without updating LRU order.

@@ -237,7 +237,10 @@ pub trait Edit<'buffer> {
                 Selection::Line(select) => {
                     let start_line = cmp::min(select.line, cursor.line);
                     let end_line = cmp::max(select.line, cursor.line);
-                    let end_index = buffer.line(end_line).expect("line index in bounds").text().len();
+                    let end_index = buffer
+                        .line_text_cow(end_line)
+                        .expect("line index in bounds")
+                        .len();
                     Some((Cursor::new(start_line, 0), Cursor::new(end_line, end_index)))
                 }
                 Selection::Word(select) => {
@@ -257,9 +260,10 @@ pub trait Edit<'buffer> {
 
                     // Move start to beginning of word
                     {
-                        let line = buffer.line(start.line).expect("line index in bounds");
-                        start.index = line
-                            .text()
+                        let text = buffer
+                            .line_text_cow(start.line)
+                            .expect("line index in bounds");
+                        start.index = text
                             .unicode_word_indices()
                             .rev()
                             .map(|(i, _)| i)
@@ -269,13 +273,14 @@ pub trait Edit<'buffer> {
 
                     // Move end to end of word
                     {
-                        let line = buffer.line(end.line).expect("line index in bounds");
-                        end.index = line
-                            .text()
+                        let text = buffer
+                            .line_text_cow(end.line)
+                            .expect("line index in bounds");
+                        end.index = text
                             .unicode_word_indices()
                             .map(|(i, word)| i + word.len())
                             .find(|&i| i > end.index)
-                            .unwrap_or_else(|| line.text().len());
+                            .unwrap_or_else(|| text.len());
                     }
 
                     Some((start, end))

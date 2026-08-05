@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 use core::{cmp, fmt};
 
@@ -199,10 +201,22 @@ impl LayoutRun<'_> {
     }
 }
 
+/// The line source a [`LayoutRunIter`] walks.
+///
+/// `Full` walks a slice of eagerly-materialized lines; `Rope` walks the rope
+/// store's warm caches (materialized lines plus shape/layout entries), both
+/// keyed by absolute line index — the iterator itself is arm-agnostic.
+#[derive(Clone, Copy, Debug)]
+enum RunSource<'b> {
+    Full(&'b [BufferLine]),
+    #[cfg(feature = "rope-buffer")]
+    Rope(&'b crate::RopeStore),
+}
+
 /// An iterator of visible text lines, see [`LayoutRun`]
 #[derive(Debug)]
 pub struct LayoutRunIter<'b> {
-    lines: &'b [BufferLine],
+    source: RunSource<'b>,
     height_opt: Option<f32>,
     line_height: f32,
     scroll: f32,
@@ -214,13 +228,21 @@ pub struct LayoutRunIter<'b> {
 
 impl<'b> LayoutRunIter<'b> {
     pub const fn new(buffer: &'b Buffer) -> Self {
-        Self::from_lines(
-            buffer.store.full().as_slice(),
-            buffer.height_opt,
-            buffer.metrics.line_height,
-            buffer.scroll.vertical,
-            buffer.scroll.line,
-        )
+        let source = match &buffer.store {
+            LineStore::Full(lines) => RunSource::Full(lines.as_slice()),
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => RunSource::Rope(store),
+        };
+        Self {
+            source,
+            height_opt: buffer.height_opt,
+            line_height: buffer.metrics.line_height,
+            scroll: buffer.scroll.vertical,
+            line_i: buffer.scroll.line,
+            layout_i: 0,
+            total_height: 0.0,
+            line_top: 0.0,
+        }
     }
 
     pub const fn from_lines(
@@ -231,7 +253,7 @@ impl<'b> LayoutRunIter<'b> {
         start: usize,
     ) -> Self {
         Self {
-            lines,
+            source: RunSource::Full(lines),
             height_opt,
             line_height,
             scroll,
@@ -247,9 +269,25 @@ impl<'b> Iterator for LayoutRunIter<'b> {
     type Item = LayoutRun<'b>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(line) = self.lines.get(self.line_i) {
-            let shape = line.shape_opt()?;
-            let layout = line.layout_opt()?;
+        loop {
+            let (text, rtl, layout): (&'b str, bool, &'b [LayoutLine]) = match self.source {
+                RunSource::Full(lines) => {
+                    let line = lines.get(self.line_i)?;
+                    let shape = line.shape_opt()?;
+                    let layout = line.layout_opt()?;
+                    (line.text(), shape.rtl, layout.as_slice())
+                }
+                #[cfg(feature = "rope-buffer")]
+                RunSource::Rope(store) => {
+                    // Warm reads only: `shape_until_scroll` materialized and
+                    // shaped the visible region; iteration stops at the first
+                    // cold line, exactly like an unshaped line in `Full`.
+                    let line = store.materialized(self.line_i)?;
+                    let shape = store.cache.shape.peek(self.line_i)?;
+                    let layout = store.cache.layout.peek(self.line_i)?;
+                    (line.text(), shape.rtl, layout.as_slice())
+                }
+            };
             while let Some(layout_line) = layout.get(self.layout_i) {
                 self.layout_i += 1;
 
@@ -272,8 +310,8 @@ impl<'b> Iterator for LayoutRunIter<'b> {
 
                 return Some(LayoutRun {
                     line_i: self.line_i,
-                    text: line.text(),
-                    rtl: shape.rtl,
+                    text,
+                    rtl,
                     glyphs: &layout_line.glyphs,
                     decorations: &layout_line.decorations,
                     line_y,
@@ -285,8 +323,6 @@ impl<'b> Iterator for LayoutRunIter<'b> {
             self.line_i += 1;
             self.layout_i = 0;
         }
-
-        None
     }
 }
 
@@ -333,23 +369,30 @@ impl fmt::Display for Metrics {
 
 /// Line storage backing for a [`Buffer`].
 ///
-/// `Full` is the classic eagerly-materialized vector. A lazily-materialized
-/// rope-backed variant is added by the large-file work; all consumers go
+/// `Full` is the classic eagerly-materialized vector. `Rope` materializes
+/// lines on demand from a [`RopeStore`](crate::RopeStore); all consumers go
 /// through the accessor methods below so the variant is invisible to them.
 #[derive(Debug)]
 pub(crate) enum LineStore {
     Full(Vec<BufferLine>),
+    #[cfg(feature = "rope-buffer")]
+    Rope(crate::RopeStore),
 }
 
 impl LineStore {
-    const fn full(&self) -> &Vec<BufferLine> {
-        match self {
-            Self::Full(lines) => lines,
-        }
-    }
+    /// The full line vector, for the mutation accessors.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a rope-backed store: mutation requires thawing into a full
+    /// store first, and a missed thaw must be loud rather than corrupting.
     fn full_mut(&mut self) -> &mut Vec<BufferLine> {
         match self {
             Self::Full(lines) => lines,
+            #[cfg(feature = "rope-buffer")]
+            Self::Rope(_) => {
+                panic!("rope store mutated without thaw — Editor must call ensure_editable first")
+            }
         }
     }
 }
@@ -378,7 +421,12 @@ pub struct Buffer {
 impl Clone for Buffer {
     fn clone(&self) -> Self {
         Self {
-            store: LineStore::Full(self.store.full().clone()),
+            store: match &self.store {
+                LineStore::Full(lines) => LineStore::Full(lines.clone()),
+                // Rope clones share the rope cheaply and start with cold caches.
+                #[cfg(feature = "rope-buffer")]
+                LineStore::Rope(store) => LineStore::Rope(store.clone()),
+            },
             metrics: self.metrics,
             width_opt: self.width_opt,
             height_opt: self.height_opt,
@@ -438,16 +486,76 @@ impl Buffer {
         buffer
     }
 
+    /// A buffer whose lines are materialized on demand from a rope store.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if `metrics.line_height` is zero.
+    #[cfg(feature = "rope-buffer")]
+    pub fn new_rope(metrics: Metrics, store: crate::RopeStore) -> Self {
+        let mut buffer = Self::new_empty(metrics);
+        buffer.store = LineStore::Rope(store);
+        // A fresh store has nothing shaped; mark it like set_text so the
+        // first shape_until_scroll actually shapes the visible region.
+        buffer.dirty |= DirtyFlags::TEXT_SET;
+        buffer.redraw = true;
+        buffer
+    }
+
+    /// Whether this buffer is backed by a rope store.
+    #[cfg(feature = "rope-buffer")]
+    pub fn is_rope(&self) -> bool {
+        matches!(self.store, LineStore::Rope(_))
+    }
+
+    /// Internal, feature-independent spelling of [`Buffer::is_rope`].
+    #[inline]
+    fn store_is_rope(&self) -> bool {
+        match self.store {
+            LineStore::Full(_) => false,
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(_) => true,
+        }
+    }
+
     /// Number of lines in the buffer.
     #[inline]
     pub fn line_count(&self) -> usize {
-        self.store.full().len()
+        match &self.store {
+            LineStore::Full(lines) => lines.len(),
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => store.line_count(),
+        }
     }
 
     /// Get the line at the given index.
+    ///
+    /// For rope-backed buffers this is a materialized-cache hit only: it is
+    /// warm only inside the shaped region (kept warm by
+    /// [`Buffer::shape_until_scroll`] and friends) and returns `None` for
+    /// cold lines. Reads that only need text and must work anywhere in the
+    /// file use [`Buffer::line_text_cow`] instead.
     #[inline]
     pub fn line(&self, i: usize) -> Option<&BufferLine> {
-        self.store.full().get(i)
+        match &self.store {
+            LineStore::Full(lines) => lines.get(i),
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => store.materialized(i),
+        }
+    }
+
+    /// Text of line `i`, without its line ending.
+    ///
+    /// Works on both storage arms anywhere in the file: borrowed from the
+    /// line for full buffers, read out of the rope for rope-backed ones.
+    /// This is the accessor for pure-text reads (cursor motion, selection,
+    /// copy, search) that must not depend on the shaped region.
+    pub fn line_text_cow(&self, i: usize) -> Option<Cow<'_, str>> {
+        match &self.store {
+            LineStore::Full(lines) => lines.get(i).map(|line| Cow::Borrowed(line.text())),
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => store.line_text(i),
+        }
     }
 
     /// Mutably get the line at the given index.
@@ -463,11 +571,34 @@ impl Buffer {
     }
 
     /// Iterate over the lines in the buffer.
+    ///
+    /// For rope-backed buffers this yields only the warm (materialized)
+    /// lines; callers needing the full text must use explicit text APIs
+    /// such as [`Buffer::line_text_cow`].
     pub fn lines_iter(&self) -> impl Iterator<Item = &BufferLine> + '_ {
-        self.store.full().iter()
+        #[cfg(feature = "rope-buffer")]
+        {
+            let (full, rope) = match &self.store {
+                LineStore::Full(lines) => (Some(lines.iter()), None),
+                LineStore::Rope(store) => (
+                    None,
+                    Some((0..store.line_count()).filter_map(move |i| store.materialized(i))),
+                ),
+            };
+            return full.into_iter().flatten().chain(rope.into_iter().flatten());
+        }
+        #[cfg(not(feature = "rope-buffer"))]
+        {
+            let LineStore::Full(lines) = &self.store;
+            lines.iter()
+        }
     }
 
     /// Mutably iterate over the lines in the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a rope-backed buffer: mutation requires thawing first.
     pub fn lines_iter_mut(&mut self) -> impl Iterator<Item = &mut BufferLine> + '_ {
         self.store.full_mut().iter_mut()
     }
@@ -500,10 +631,18 @@ impl Buffer {
     /// Whether the buffer has no lines.
     #[inline]
     pub fn lines_is_empty(&self) -> bool {
-        self.store.full().is_empty()
+        match &self.store {
+            LineStore::Full(lines) => lines.is_empty(),
+            // A rope store always reports at least one line.
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => store.line_count() == 0,
+        }
     }
 
     /// Get the text of a line by index.
+    ///
+    /// For rope-backed buffers this is warm-only (see [`Buffer::line`]);
+    /// use [`Buffer::line_text_cow`] for reads that must work cold.
     #[inline]
     pub fn line_text(&self, line_i: usize) -> Option<&str> {
         self.line(line_i).map(|l| l.text())
@@ -524,6 +663,26 @@ impl Buffer {
     /// Returns `true` if any flags were set (i.e., work may be needed).
     fn resolve_dirty(&mut self) -> bool {
         let dirty = self.dirty;
+        #[cfg(feature = "rope-buffer")]
+        if let LineStore::Rope(store) = &mut self.store {
+            if dirty.is_empty() {
+                // Rope lines cannot be externally invalidated (there is no
+                // `line_mut` access without thaw), so no per-line scan.
+                return false;
+            }
+            if !dirty.contains(DirtyFlags::TEXT_SET) {
+                if dirty.contains(DirtyFlags::DIRECTION) || dirty.contains(DirtyFlags::TAB_SHAPE) {
+                    // Reshape implies relayout: drop both caches. Cheaper than
+                    // scanning millions of rope lines for affected ones.
+                    store.cache.clear();
+                } else if dirty.contains(DirtyFlags::RELAYOUT) {
+                    store.cache.clear_layout();
+                }
+            }
+            self.redraw = true;
+            self.dirty = DirtyFlags::empty();
+            return true;
+        }
         if dirty.is_empty() {
             // individual lines may have been externally invalidated
             if self.lines_iter().any(|line| line.needs_reshaping()) {
@@ -678,6 +837,12 @@ impl Buffer {
             return;
         }
         let metrics = self.metrics;
+        // The rope arm differs from the full arm in three ways, all below:
+        // pruning is a no-op (its LRU caches bound memory on their own), an
+        // unset height is capped at ~50 lines instead of shaping the whole
+        // file, and the end-of-buffer scroll-up adjustment only applies when
+        // a height is actually set.
+        let is_rope = self.store_is_rope();
 
         // Clamp scroll.line to valid range (lines may have been removed by editing)
         if self.scroll.line >= self.line_count() {
@@ -712,9 +877,16 @@ impl Buffer {
             }
 
             let scroll_start = self.scroll.vertical;
-            let scroll_end = scroll_start + self.height_opt.unwrap_or(f32::INFINITY);
+            let default_height = if is_rope {
+                // A rope store with unbounded height would materialize the
+                // whole file; cap the shaped run instead.
+                metrics.line_height * 50.0
+            } else {
+                f32::INFINITY
+            };
+            let scroll_end = scroll_start + self.height_opt.unwrap_or(default_height);
 
-            if prune {
+            if prune && !is_rope {
                 for line_i in 0..self.scroll.line {
                     self.line_mut(line_i)
                         .expect("line index in bounds")
@@ -724,7 +896,7 @@ impl Buffer {
             let mut total_height = 0.0;
             for line_i in self.scroll.line..self.line_count() {
                 if total_height > scroll_end {
-                    if prune {
+                    if prune && !is_rope {
                         self.line_mut(line_i)
                             .expect("line index in bounds")
                             .reset_shaping();
@@ -750,7 +922,10 @@ impl Buffer {
                 }
             }
 
-            if total_height < scroll_end && self.scroll.line > 0 {
+            if total_height < scroll_end
+                && self.scroll.line > 0
+                && (!is_rope || self.height_opt.is_some())
+            {
                 // Need to scroll up to stay inside of buffer
                 self.scroll.vertical -= scroll_end - total_height;
             } else {
@@ -802,10 +977,55 @@ impl Buffer {
         font_system: &mut FontSystem,
         line_i: usize,
     ) -> Option<&ShapeLine> {
+        #[cfg(feature = "rope-buffer")]
+        if self.store_is_rope() {
+            return self.rope_line_shape(font_system, line_i);
+        }
         let tab_width = self.tab_width;
         let direction = self.direction;
         let line = self.line_mut(line_i)?;
         Some(line.shape(font_system, tab_width, direction))
+    }
+
+    /// Rope arm of [`Buffer::line_shape`]: materialize the line, then shape
+    /// into the store's cache keyed by absolute line index.
+    #[cfg(feature = "rope-buffer")]
+    fn rope_line_shape(
+        &mut self,
+        font_system: &mut FontSystem,
+        line_i: usize,
+    ) -> Option<&ShapeLine> {
+        let tab_width = self.tab_width;
+        let direction = self.direction;
+        let store = match &mut self.store {
+            LineStore::Rope(store) => store,
+            LineStore::Full(_) => return None,
+        };
+        if store.cache.shape.contains(line_i) {
+            // Keep the BufferLine warm so `line`/`layout_runs` can see it.
+            store.materialize(line_i)?;
+        } else {
+            let (text, attrs_list, shaping) = {
+                let line = store.materialize(line_i)?;
+                (
+                    line.text().to_string(),
+                    line.attrs_list().clone(),
+                    line.shaping(),
+                )
+            };
+            let mut shape_line = ShapeLine::empty();
+            shape_line.build(
+                font_system,
+                &text,
+                &attrs_list,
+                shaping,
+                tab_width,
+                direction,
+            );
+            store.cache.shape.insert(line_i, shape_line);
+            store.cache.layout.remove(line_i);
+        }
+        store.cache.shape.get(line_i)
     }
 
     /// Lay out the provided line index and return the result
@@ -814,6 +1034,10 @@ impl Buffer {
         font_system: &mut FontSystem,
         line_i: usize,
     ) -> Option<&[LayoutLine]> {
+        #[cfg(feature = "rope-buffer")]
+        if self.store_is_rope() {
+            return self.rope_line_layout(font_system, line_i);
+        }
         let font_size = self.metrics.font_size;
         let width_opt = self.width_opt;
         let wrap = self.wrap;
@@ -834,6 +1058,46 @@ impl Buffer {
             hinting,
             direction,
         ))
+    }
+
+    /// Rope arm of [`Buffer::line_layout`]: lay the cached shape out into the
+    /// store's layout cache, keyed by absolute line index.
+    #[cfg(feature = "rope-buffer")]
+    fn rope_line_layout(
+        &mut self,
+        font_system: &mut FontSystem,
+        line_i: usize,
+    ) -> Option<&[LayoutLine]> {
+        // Ensure the shape exists (this also warms the materialized line).
+        self.rope_line_shape(font_system, line_i)?;
+        let font_size = self.metrics.font_size;
+        let width_opt = self.width_opt;
+        let wrap = self.wrap;
+        let ellipsize = self.ellipsize;
+        let monospace_width = self.monospace_width;
+        let hinting = self.hinting;
+        let store = match &mut self.store {
+            LineStore::Rope(store) => store,
+            LineStore::Full(_) => return None,
+        };
+        if !store.cache.layout.contains(line_i) {
+            let align = store.materialized(line_i).and_then(BufferLine::align);
+            let shape = store.cache.shape.get(line_i)?;
+            let mut layout = Vec::with_capacity(1);
+            shape.layout_to_buffer(
+                &mut font_system.shape_buffer,
+                font_size,
+                width_opt,
+                wrap,
+                ellipsize,
+                align,
+                &mut layout,
+                monospace_width,
+                hinting,
+            );
+            store.cache.layout.insert(line_i, layout);
+        }
+        store.cache.layout.get(line_i).map(Vec::as_slice)
     }
 
     /// Get the current [`Metrics`]
@@ -1389,6 +1653,10 @@ impl Buffer {
     /// Returns if the text direction for a given line is RTL
     /// Returns `None` if the line doesn't exist or hasn't been shaped yet.
     pub fn is_rtl(&self, line: usize) -> Option<bool> {
+        #[cfg(feature = "rope-buffer")]
+        if let LineStore::Rope(store) = &self.store {
+            return store.cache.shape.peek(line).map(|shape| shape.rtl);
+        }
         self.line(line)?.shape_opt().map(|shape| shape.rtl)
     }
 
@@ -1435,11 +1703,11 @@ impl Buffer {
                 }
             }
             Motion::Previous => {
-                let line = self.line(cursor.line)?;
+                let text = self.line_text_cow(cursor.line)?;
                 if cursor.index > 0 {
                     // Find previous character index
                     let mut prev_index = 0;
-                    for (i, _) in line.text().grapheme_indices(true) {
+                    for (i, _) in text.grapheme_indices(true) {
                         if i < cursor.index {
                             prev_index = i;
                         } else {
@@ -1451,15 +1719,15 @@ impl Buffer {
                     cursor.affinity = Affinity::After;
                 } else if cursor.line > 0 {
                     cursor.line -= 1;
-                    cursor.index = self.line(cursor.line)?.text().len();
+                    cursor.index = self.line_text_cow(cursor.line)?.len();
                     cursor.affinity = Affinity::After;
                 }
                 cursor_x_opt = None;
             }
             Motion::Next => {
-                let line = self.line(cursor.line)?;
-                if cursor.index < line.text().len() {
-                    for (i, c) in line.text().grapheme_indices(true) {
+                let text = self.line_text_cow(cursor.line)?;
+                if cursor.index < text.len() {
+                    for (i, c) in text.grapheme_indices(true) {
                         if i == cursor.index {
                             cursor.index += c.len();
                             cursor.affinity = Affinity::Before;
@@ -1570,17 +1838,15 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::SoftHome => {
-                let line = self.line(cursor.line)?;
-                cursor.index = line
-                    .text()
+                let text = self.line_text_cow(cursor.line)?;
+                cursor.index = text
                     .char_indices()
                     .find_map(|(i, c)| if c.is_whitespace() { None } else { Some(i) })
                     .unwrap_or(0);
                 cursor_x_opt = None;
             }
             Motion::End => {
-                let line = self.line(cursor.line)?;
-                cursor.index = line.text().len();
+                cursor.index = self.line_text_cow(cursor.line)?.len();
                 cursor_x_opt = None;
             }
             Motion::ParagraphStart => {
@@ -1588,7 +1854,7 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::ParagraphEnd => {
-                cursor.index = self.line(cursor.line)?.text().len();
+                cursor.index = self.line_text_cow(cursor.line)?.len();
                 cursor_x_opt = None;
             }
             Motion::PageUp => {
@@ -1635,10 +1901,9 @@ impl Buffer {
                 }
             }
             Motion::PreviousWord => {
-                let line = self.line(cursor.line)?;
+                let text = self.line_text_cow(cursor.line)?;
                 if cursor.index > 0 {
-                    cursor.index = line
-                        .text()
+                    cursor.index = text
                         .unicode_word_indices()
                         .rev()
                         .map(|(i, _)| i)
@@ -1646,19 +1911,18 @@ impl Buffer {
                         .unwrap_or(0);
                 } else if cursor.line > 0 {
                     cursor.line -= 1;
-                    cursor.index = self.line(cursor.line)?.text().len();
+                    cursor.index = self.line_text_cow(cursor.line)?.len();
                 }
                 cursor_x_opt = None;
             }
             Motion::NextWord => {
-                let line = self.line(cursor.line)?;
-                if cursor.index < line.text().len() {
-                    cursor.index = line
-                        .text()
+                let text = self.line_text_cow(cursor.line)?;
+                if cursor.index < text.len() {
+                    cursor.index = text
                         .unicode_word_indices()
                         .map(|(i, word)| i + word.len())
                         .find(|&i| i > cursor.index)
-                        .unwrap_or_else(|| line.text().len());
+                        .unwrap_or_else(|| text.len());
                 } else if cursor.line + 1 < self.line_count() {
                     cursor.line += 1;
                     cursor.index = 0;
@@ -1716,7 +1980,7 @@ impl Buffer {
             }
             Motion::BufferEnd => {
                 cursor.line = self.line_count().saturating_sub(1);
-                cursor.index = self.line(cursor.line)?.text().len();
+                cursor.index = self.line_text_cow(cursor.line)?.len();
                 cursor_x_opt = None;
             }
             Motion::GotoLine(line) => {
@@ -1930,5 +2194,84 @@ impl BorrowedWithFontSystem<'_, Buffer> {
         F: FnMut(i32, i32, u32, u32, Color),
     {
         self.inner.draw(self.font_system, cache, color, f);
+    }
+}
+
+#[cfg(all(test, feature = "rope-buffer", feature = "std"))]
+mod rope_arm_tests {
+    use super::{Buffer, Metrics};
+    use crate::{Attrs, FontSystem, RopeStore, Shaping};
+
+    fn rope_buffer(lines: usize) -> Buffer {
+        let text: String = (0..lines)
+            .map(|i| format!("line {i} padding padding\n"))
+            .collect();
+        let store = RopeStore::from_text(&text, &Attrs::new(), Shaping::Advanced);
+        let mut buffer = Buffer::new_rope(Metrics::new(14.0, 20.0), store);
+        buffer.set_size(Some(800.0), Some(600.0));
+        buffer
+    }
+
+    #[test]
+    fn rope_accessors_cold_and_warm() {
+        let buffer = rope_buffer(10_000);
+        assert!(buffer.is_rope());
+        // +1: the trailing newline produces a final empty line.
+        assert_eq!(buffer.line_count(), 10_001);
+        assert!(!buffer.lines_is_empty());
+        // Cold: no line materialized yet, but text reads work anywhere.
+        assert!(buffer.line(9_999).is_none());
+        assert_eq!(
+            buffer.line_text_cow(9_999).as_deref(),
+            Some("line 9999 padding padding")
+        );
+        assert!(buffer.line_text_cow(10_001).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "rope store mutated without thaw")]
+    fn rope_mutation_without_thaw_is_loud() {
+        let mut buffer = rope_buffer(10);
+        buffer.push_line(crate::BufferLine::empty());
+    }
+
+    #[test]
+    fn rope_layout_runs_start_at_scroll() {
+        let mut font_system = FontSystem::new();
+        let mut buffer = rope_buffer(10_000);
+        buffer.shape_until_scroll(&mut font_system, false);
+        let line_indices: Vec<usize> = buffer.layout_runs().map(|run| run.line_i).collect();
+        assert!(!line_indices.is_empty());
+        assert_eq!(line_indices[0], buffer.scroll().line);
+        assert_eq!(line_indices[0], 0);
+        // Unwrapped short lines: runs walk consecutive absolute indices.
+        for pair in line_indices.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1);
+        }
+    }
+
+    #[test]
+    fn rope_deep_scroll_keeps_absolute_coordinates() {
+        let mut font_system = FontSystem::new();
+        let mut buffer = rope_buffer(10_000);
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let mut scroll = buffer.scroll();
+        scroll.line = 7_000;
+        buffer.set_scroll(scroll);
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let runs: Vec<(usize, String)> = buffer
+            .layout_runs()
+            .map(|run| (run.line_i, run.text.to_string()))
+            .collect();
+        assert!(!runs.is_empty());
+        // THE absolute-coordinates proof: no window offset anywhere.
+        assert_eq!(runs[0].0, 7_000);
+        assert_eq!(runs[0].1, "line 7000 padding padding");
+        assert!(runs.iter().all(|(line_i, _)| *line_i >= 7_000));
+
+        let cursor = buffer.hit(10.0, 10.0).expect("hit inside shaped region");
+        assert!(cursor.line >= 7_000, "hit cursor line {}", cursor.line);
     }
 }

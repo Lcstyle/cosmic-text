@@ -71,9 +71,8 @@ fn search<'buffer, E: Edit<'buffer>>(editor: &mut E, value: &str, forwards: bool
         while cursor.line < editor.with_buffer(|buffer| buffer.line_count()) {
             if let Some(index) = editor.with_buffer(|buffer| {
                 buffer
-                    .line(cursor.line)
+                    .line_text_cow(cursor.line)
                     .expect("cursor line in bounds")
-                    .text()
                     .match_indices(value)
                     .filter_map(|(i, _)| {
                         if cursor.line != start_line || i > cursor.index {
@@ -98,9 +97,8 @@ fn search<'buffer, E: Edit<'buffer>>(editor: &mut E, value: &str, forwards: bool
 
             if let Some(index) = editor.with_buffer(|buffer| {
                 buffer
-                    .line(cursor.line)
+                    .line_text_cow(cursor.line)
                     .expect("cursor line in bounds")
-                    .text()
                     .rmatch_indices(value)
                     .filter_map(|(i, _)| {
                         if cursor.line != start_line || i < cursor.index {
@@ -129,8 +127,7 @@ fn select_in<'buffer, E: Edit<'buffer>>(editor: &mut E, start_c: char, end_c: ch
         let mut starts = 0;
         let mut ends = 0;
         'find_end: loop {
-            let line = buffer.line(end.line).expect("line index in bounds");
-            let text = line.text();
+            let text = buffer.line_text_cow(end.line).expect("line index in bounds");
             for (i, c) in text[end.index..].char_indices() {
                 if c == end_c {
                     ends += 1;
@@ -153,8 +150,7 @@ fn select_in<'buffer, E: Edit<'buffer>>(editor: &mut E, start_c: char, end_c: ch
         // Search backwards to resolve starts and ends
         let mut start = cursor;
         'find_start: loop {
-            let line = buffer.line(start.line).expect("line index in bounds");
-            let text = line.text();
+            let text = buffer.line_text_cow(start.line).expect("line index in bounds");
             for (i, c) in text[..start.index].char_indices().rev() {
                 if c == start_c {
                     starts += 1;
@@ -168,7 +164,7 @@ fn select_in<'buffer, E: Edit<'buffer>>(editor: &mut E, start_c: char, end_c: ch
             }
             if start.line > 0 {
                 start.line -= 1;
-                start.index = buffer.line(start.line).expect("line index in bounds").text().len();
+                start.index = buffer.line_text_cow(start.line).expect("line index in bounds").len();
             } else {
                 break 'find_start;
             }
@@ -415,9 +411,9 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
                     Some((start_line, end_line, left, right))
                         if line_i >= start_line && line_i <= end_line =>
                     {
-                        let text = buffer.line(line_i).expect("line index in bounds").text();
-                        let l = super::editor::block_clamp_col(text, left);
-                        let r = cmp::max(l, super::editor::block_clamp_col(text, right));
+                        let text = buffer.line_text_cow(line_i).expect("line index in bounds");
+                        let l = super::editor::block_clamp_col(&text, left);
+                        let r = cmp::max(l, super::editor::block_clamp_col(&text, right));
                         Some((Cursor::new(line_i, l), Cursor::new(line_i, r)))
                     }
                     Some(_) => None,
@@ -733,9 +729,8 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                     if cursor.index
                         < editor.with_buffer(|buffer| {
                             buffer
-                                .line(cursor.line)
+                                .line_text_cow(cursor.line)
                                 .expect("cursor line in bounds")
-                                .text()
                                 .len()
                         })
                     {
@@ -761,7 +756,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                                     let mut cursor = editor.cursor();
                                     if after {
                                         editor.with_buffer(|buffer| {
-                                            let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                            let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                             if let Some(c) = text[cursor.index..].chars().next() {
                                                 cursor.index += c.len_utf8();
                                             }
@@ -851,8 +846,8 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             let mut cursor = editor.cursor();
                             let mut selection = editor.selection();
                             editor.with_buffer(|buffer| {
-                                let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
-                                match WordIter::new(text, word)
+                                let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
+                                match WordIter::new(&text, word)
                                     .find(|&(i, w)| i <= cursor.index && i + w.len() > cursor.index)
                                 {
                                     Some((i, w)) => {
@@ -931,7 +926,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                         modit::Motion::NextChar(find_c) => {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
-                                let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                 if cursor.index < text.len() {
                                     if let Some((i, _)) = text[cursor.index..]
                                         .char_indices()
@@ -947,7 +942,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                         modit::Motion::NextCharTill(find_c) => {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
-                                let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                 if cursor.index < text.len() {
                                     let mut last_i = 0;
                                     for (i, c) in text[cursor.index..].char_indices() {
@@ -974,9 +969,9 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
                                 loop {
-                                    let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                    let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                     if cursor.index < text.len() {
-                                        cursor.index = WordIter::new(text, word)
+                                        cursor.index = WordIter::new(&text, word)
                                             .map(|(i, w)| {
                                                 i + w
                                                     .char_indices()
@@ -1006,9 +1001,9 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
                                 loop {
-                                    let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                    let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                     if cursor.index < text.len() {
-                                        cursor.index = WordIter::new(text, word)
+                                        cursor.index = WordIter::new(&text, word)
                                             .map(|(i, _)| i)
                                             .find(|&i| i > cursor.index)
                                             .unwrap_or(text.len());
@@ -1033,7 +1028,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                         modit::Motion::PreviousChar(find_c) => {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
-                                let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                 if cursor.index > 0 {
                                     if let Some((i, _)) = text[..cursor.index]
                                         .char_indices()
@@ -1049,7 +1044,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                         modit::Motion::PreviousCharTill(find_c) => {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
-                                let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                 if cursor.index > 0 {
                                     if let Some(i) = text[..cursor.index]
                                         .char_indices()
@@ -1082,9 +1077,9 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
                                 loop {
-                                    let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                    let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                     if cursor.index > 0 {
-                                        cursor.index = WordIter::new(text, word)
+                                        cursor.index = WordIter::new(&text, word)
                                             .map(|(i, w)| {
                                                 i + w
                                                     .char_indices()
@@ -1102,7 +1097,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                                     } else if cursor.line > 0 {
                                         // Go to previous line and rerun loop
                                         cursor.line -= 1;
-                                        cursor.index = buffer.line(cursor.line).expect("cursor line in bounds").text().len();
+                                        cursor.index = buffer.line_text_cow(cursor.line).expect("cursor line in bounds").len();
                                         continue;
                                     }
                                     break;
@@ -1115,9 +1110,9 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             let mut cursor = editor.cursor();
                             editor.with_buffer(|buffer| {
                                 loop {
-                                    let text = buffer.line(cursor.line).expect("cursor line in bounds").text();
+                                    let text = buffer.line_text_cow(cursor.line).expect("cursor line in bounds");
                                     if cursor.index > 0 {
-                                        cursor.index = WordIter::new(text, word)
+                                        cursor.index = WordIter::new(&text, word)
                                             .map(|(i, _)| i)
                                             .filter(|&i| i < cursor.index)
                                             .last()
@@ -1129,7 +1124,7 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                                     } else if cursor.line > 0 {
                                         // Go to previous line and rerun loop
                                         cursor.line -= 1;
-                                        cursor.index = buffer.line(cursor.line).expect("cursor line in bounds").text().len();
+                                        cursor.index = buffer.line_text_cow(cursor.line).expect("cursor line in bounds").len();
                                         continue;
                                     }
                                     break;
@@ -1144,9 +1139,8 @@ impl<'buffer> Edit<'buffer> for ViEditor<'_, 'buffer> {
                             if cursor.index
                                 < editor.with_buffer(|buffer| {
                                     buffer
-                                        .line(cursor.line)
+                                        .line_text_cow(cursor.line)
                                         .expect("cursor line in bounds")
-                                        .text()
                                         .len()
                                 })
                             {
