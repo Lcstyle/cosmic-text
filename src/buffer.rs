@@ -215,7 +215,7 @@ pub struct LayoutRunIter<'b> {
 impl<'b> LayoutRunIter<'b> {
     pub const fn new(buffer: &'b Buffer) -> Self {
         Self::from_lines(
-            buffer.lines.as_slice(),
+            buffer.store.full().as_slice(),
             buffer.height_opt,
             buffer.metrics.line_height,
             buffer.scroll.vertical,
@@ -331,11 +331,34 @@ impl fmt::Display for Metrics {
     }
 }
 
+/// Line storage backing for a [`Buffer`].
+///
+/// `Full` is the classic eagerly-materialized vector. A lazily-materialized
+/// rope-backed variant is added by the large-file work; all consumers go
+/// through the accessor methods below so the variant is invisible to them.
+#[derive(Debug)]
+pub(crate) enum LineStore {
+    Full(Vec<BufferLine>),
+}
+
+impl LineStore {
+    const fn full(&self) -> &Vec<BufferLine> {
+        match self {
+            Self::Full(lines) => lines,
+        }
+    }
+    fn full_mut(&mut self) -> &mut Vec<BufferLine> {
+        match self {
+            Self::Full(lines) => lines,
+        }
+    }
+}
+
 /// A buffer of text that is shaped and laid out
 #[derive(Debug)]
 pub struct Buffer {
-    /// [`BufferLine`]s (or paragraphs) of text in the buffer
-    pub lines: Vec<BufferLine>,
+    /// Line storage — [`BufferLine`]s (or paragraphs) of text in the buffer
+    store: LineStore,
     metrics: Metrics,
     width_opt: Option<f32>,
     height_opt: Option<f32>,
@@ -355,7 +378,7 @@ pub struct Buffer {
 impl Clone for Buffer {
     fn clone(&self) -> Self {
         Self {
-            lines: self.lines.clone(),
+            store: LineStore::Full(self.store.full().clone()),
             metrics: self.metrics,
             width_opt: self.width_opt,
             height_opt: self.height_opt,
@@ -387,7 +410,7 @@ impl Buffer {
     pub fn new_empty(metrics: Metrics) -> Self {
         assert_ne!(metrics.line_height, 0.0, "line height cannot be 0");
         Self {
-            lines: Vec::new(),
+            store: LineStore::Full(Vec::new()),
             metrics,
             width_opt: None,
             height_opt: None,
@@ -415,22 +438,75 @@ impl Buffer {
         buffer
     }
 
-    /// Get the number of lines in the buffer.
-    ///
-    /// This is equivalent to `buffer.lines.len()` but provides a more
-    /// abstract interface that will work with both Vec and Rope backends.
+    /// Number of lines in the buffer.
     #[inline]
     pub fn line_count(&self) -> usize {
-        self.lines.len()
+        self.store.full().len()
+    }
+
+    /// Get the line at the given index.
+    #[inline]
+    pub fn line(&self, i: usize) -> Option<&BufferLine> {
+        self.store.full().get(i)
+    }
+
+    /// Mutably get the line at the given index.
+    #[inline]
+    pub fn line_mut(&mut self, i: usize) -> Option<&mut BufferLine> {
+        self.store.full_mut().get_mut(i)
+    }
+
+    /// Mutably get the last line.
+    #[inline]
+    pub fn last_line_mut(&mut self) -> Option<&mut BufferLine> {
+        self.store.full_mut().last_mut()
+    }
+
+    /// Iterate over the lines in the buffer.
+    pub fn lines_iter(&self) -> impl Iterator<Item = &BufferLine> + '_ {
+        self.store.full().iter()
+    }
+
+    /// Mutably iterate over the lines in the buffer.
+    pub fn lines_iter_mut(&mut self) -> impl Iterator<Item = &mut BufferLine> + '_ {
+        self.store.full_mut().iter_mut()
+    }
+
+    /// Append a line to the buffer.
+    pub fn push_line(&mut self, line: BufferLine) {
+        self.store.full_mut().push(line);
+    }
+
+    /// Insert a line at the given index.
+    pub fn insert_line(&mut self, i: usize, line: BufferLine) {
+        self.store.full_mut().insert(i, line);
+    }
+
+    /// Remove and return the line at the given index.
+    pub fn remove_line(&mut self, i: usize) -> BufferLine {
+        self.store.full_mut().remove(i)
+    }
+
+    /// Truncate the buffer to the given number of lines.
+    pub fn truncate_lines(&mut self, len: usize) {
+        self.store.full_mut().truncate(len);
+    }
+
+    /// Remove all lines from the buffer.
+    pub fn clear_lines(&mut self) {
+        self.store.full_mut().clear();
+    }
+
+    /// Whether the buffer has no lines.
+    #[inline]
+    pub fn lines_is_empty(&self) -> bool {
+        self.store.full().is_empty()
     }
 
     /// Get the text of a line by index.
-    ///
-    /// This is equivalent to `buffer.lines.get(line_i).map(|l| l.text())`
-    /// but provides a more abstract interface.
     #[inline]
     pub fn line_text(&self, line_i: usize) -> Option<&str> {
-        self.lines.get(line_i).map(|l| l.text())
+        self.line(line_i).map(|l| l.text())
     }
 
     /// Mutably borrows the buffer together with an [`FontSystem`] for more convenient methods
@@ -450,7 +526,7 @@ impl Buffer {
         let dirty = self.dirty;
         if dirty.is_empty() {
             // individual lines may have been externally invalidated
-            if self.lines.iter().any(|line| line.needs_reshaping()) {
+            if self.lines_iter().any(|line| line.needs_reshaping()) {
                 self.redraw = true;
                 return true;
             }
@@ -461,20 +537,20 @@ impl Buffer {
             // Lines were replaced — already fresh, no cache to invalidate.
         } else {
             if dirty.contains(DirtyFlags::DIRECTION) {
-                for line in &mut self.lines {
+                for line in self.lines_iter_mut() {
                     if line.shape_opt().is_some() {
                         line.reset_shaping();
                     }
                 }
             } else if dirty.contains(DirtyFlags::TAB_SHAPE) {
-                for line in &mut self.lines {
+                for line in self.lines_iter_mut() {
                     if line.shape_opt().is_some() && line.text().contains('\t') {
                         line.reset_shaping();
                     }
                 }
             }
             if dirty.contains(DirtyFlags::RELAYOUT) {
-                for line in &mut self.lines {
+                for line in self.lines_iter_mut() {
                     if line.shape_opt().is_some() {
                         line.reset_layout();
                     }
@@ -604,8 +680,8 @@ impl Buffer {
         let metrics = self.metrics;
 
         // Clamp scroll.line to valid range (lines may have been removed by editing)
-        if self.scroll.line >= self.lines.len() {
-            self.scroll.line = self.lines.len().saturating_sub(1);
+        if self.scroll.line >= self.line_count() {
+            self.scroll.line = self.line_count().saturating_sub(1);
             self.scroll.vertical = 0.0;
         }
 
@@ -640,14 +716,18 @@ impl Buffer {
 
             if prune {
                 for line_i in 0..self.scroll.line {
-                    self.lines[line_i].reset_shaping();
+                    self.line_mut(line_i)
+                        .expect("line index in bounds")
+                        .reset_shaping();
                 }
             }
             let mut total_height = 0.0;
-            for line_i in self.scroll.line..self.lines.len() {
+            for line_i in self.scroll.line..self.line_count() {
                 if total_height > scroll_end {
                     if prune {
-                        self.lines[line_i].reset_shaping();
+                        self.line_mut(line_i)
+                            .expect("line index in bounds")
+                            .reset_shaping();
                         continue;
                     }
                     break;
@@ -722,8 +802,10 @@ impl Buffer {
         font_system: &mut FontSystem,
         line_i: usize,
     ) -> Option<&ShapeLine> {
-        let line = self.lines.get_mut(line_i)?;
-        Some(line.shape(font_system, self.tab_width, self.direction))
+        let tab_width = self.tab_width;
+        let direction = self.direction;
+        let line = self.line_mut(line_i)?;
+        Some(line.shape(font_system, tab_width, direction))
     }
 
     /// Lay out the provided line index and return the result
@@ -732,17 +814,25 @@ impl Buffer {
         font_system: &mut FontSystem,
         line_i: usize,
     ) -> Option<&[LayoutLine]> {
-        let line = self.lines.get_mut(line_i)?;
+        let font_size = self.metrics.font_size;
+        let width_opt = self.width_opt;
+        let wrap = self.wrap;
+        let ellipsize = self.ellipsize;
+        let monospace_width = self.monospace_width;
+        let tab_width = self.tab_width;
+        let hinting = self.hinting;
+        let direction = self.direction;
+        let line = self.line_mut(line_i)?;
         Some(line.layout(
             font_system,
-            self.metrics.font_size,
-            self.width_opt,
-            self.wrap,
-            self.ellipsize,
-            self.monospace_width,
-            self.tab_width,
-            self.hinting,
-            self.direction,
+            font_size,
+            width_opt,
+            wrap,
+            ellipsize,
+            monospace_width,
+            tab_width,
+            hinting,
+            direction,
         ))
     }
 
@@ -922,14 +1012,15 @@ impl Buffer {
         let mut line_count = 0;
         for (range, ending) in LineIter::new(text) {
             let line_text = &text[range];
-            if line_count < self.lines.len() {
+            if line_count < self.line_count() {
                 // Reuse existing line: reclaim String/AttrsList allocations
-                let mut reused_text = self.lines[line_count].reclaim_text();
+                let line = self.line_mut(line_count).expect("line index in bounds");
+                let mut reused_text = line.reclaim_text();
                 reused_text.push_str(line_text);
-                let reused_attrs = self.lines[line_count].reclaim_attrs().reset(attrs);
-                self.lines[line_count].reset_new(reused_text, ending, reused_attrs, shaping);
+                let reused_attrs = line.reclaim_attrs().reset(attrs);
+                line.reset_new(reused_text, ending, reused_attrs, shaping);
             } else {
-                self.lines.push(BufferLine::new(
+                self.push_line(BufferLine::new(
                     line_text,
                     ending,
                     AttrsList::new(attrs),
@@ -943,22 +1034,20 @@ impl Buffer {
         // When no lines were produced (empty text), unwrap_or_default() returns
         // LineEnding::Lf (the Default), which is != None, so we add an empty line.
         let last_ending = if line_count > 0 {
-            self.lines[line_count - 1].ending()
+            self.line(line_count - 1)
+                .expect("line index in bounds")
+                .ending()
         } else {
             LineEnding::default()
         };
         if last_ending != LineEnding::None {
-            if line_count < self.lines.len() {
-                let reused_text = self.lines[line_count].reclaim_text();
-                let reused_attrs = self.lines[line_count].reclaim_attrs().reset(attrs);
-                self.lines[line_count].reset_new(
-                    reused_text,
-                    LineEnding::None,
-                    reused_attrs,
-                    shaping,
-                );
+            if line_count < self.line_count() {
+                let line = self.line_mut(line_count).expect("line index in bounds");
+                let reused_text = line.reclaim_text();
+                let reused_attrs = line.reclaim_attrs().reset(attrs);
+                line.reset_new(reused_text, LineEnding::None, reused_attrs, shaping);
             } else {
-                self.lines.push(BufferLine::new(
+                self.push_line(BufferLine::new(
                     "",
                     LineEnding::None,
                     AttrsList::new(attrs),
@@ -969,10 +1058,10 @@ impl Buffer {
         }
 
         // Discard excess lines now that we have reused as much of the existing allocations as possible.
-        self.lines.truncate(line_count);
+        self.truncate_lines(line_count);
 
         if alignment.is_some() {
-            self.lines.iter_mut().for_each(|line| {
+            self.lines_iter_mut().for_each(|line| {
                 line.set_align(alignment);
             });
         }
@@ -1032,28 +1121,28 @@ impl Buffer {
 
         let mut line_count = 0;
         let mut attrs_list = self
-            .lines
-            .get_mut(line_count)
+            .line_mut(line_count)
             .map_or_else(|| AttrsList::new(&Attrs::new()), BufferLine::reclaim_attrs)
             .reset(default_attrs);
         let mut line_string = self
-            .lines
-            .get_mut(line_count)
+            .line_mut(line_count)
             .map(BufferLine::reclaim_text)
             .unwrap_or_default();
 
         loop {
             let (Some(line_range), Some((attrs, span_range))) = (&maybe_line, &maybe_span) else {
                 // this is reached only if this text is empty
-                if self.lines.len() == line_count {
-                    self.lines.push(BufferLine::empty());
+                if self.line_count() == line_count {
+                    self.push_line(BufferLine::empty());
                 }
-                self.lines[line_count].reset_new(
-                    String::new(),
-                    line_ending,
-                    AttrsList::new(default_attrs),
-                    shaping,
-                );
+                self.line_mut(line_count)
+                    .expect("line index in bounds")
+                    .reset_new(
+                        String::new(),
+                        line_ending,
+                        AttrsList::new(default_attrs),
+                        shaping,
+                    );
                 line_count += 1;
                 break;
             };
@@ -1089,33 +1178,30 @@ impl Buffer {
                 if maybe_line.is_some() {
                     // finalize this line and start a new line
                     let next_attrs_list = self
-                        .lines
-                        .get_mut(line_count + 1)
+                        .line_mut(line_count + 1)
                         .map_or_else(|| AttrsList::new(&Attrs::new()), BufferLine::reclaim_attrs)
                         .reset(default_attrs);
                     let next_line_string = self
-                        .lines
-                        .get_mut(line_count + 1)
+                        .line_mut(line_count + 1)
                         .map(BufferLine::reclaim_text)
                         .unwrap_or_default();
                     let prev_attrs_list = core::mem::replace(&mut attrs_list, next_attrs_list);
                     let prev_line_string = core::mem::replace(&mut line_string, next_line_string);
-                    if self.lines.len() == line_count {
-                        self.lines.push(BufferLine::empty());
+                    if self.line_count() == line_count {
+                        self.push_line(BufferLine::empty());
                     }
-                    self.lines[line_count].reset_new(
-                        prev_line_string,
-                        line_ending,
-                        prev_attrs_list,
-                        shaping,
-                    );
+                    self.line_mut(line_count)
+                        .expect("line index in bounds")
+                        .reset_new(prev_line_string, line_ending, prev_attrs_list, shaping);
                     line_count += 1;
                 } else {
                     // finalize the final line
-                    if self.lines.len() == line_count {
-                        self.lines.push(BufferLine::empty());
+                    if self.line_count() == line_count {
+                        self.push_line(BufferLine::empty());
                     }
-                    self.lines[line_count].reset_new(line_string, line_ending, attrs_list, shaping);
+                    self.line_mut(line_count)
+                        .expect("line index in bounds")
+                        .reset_new(line_string, line_ending, attrs_list, shaping);
                     line_count += 1;
                     break;
                 }
@@ -1123,9 +1209,9 @@ impl Buffer {
         }
 
         // Discard excess lines now that we have reused as much of the existing allocations as possible.
-        self.lines.truncate(line_count);
+        self.truncate_lines(line_count);
 
-        self.lines.iter_mut().for_each(|line| {
+        self.lines_iter_mut().for_each(|line| {
             line.set_align(alignment);
         });
 
@@ -1303,7 +1389,7 @@ impl Buffer {
     /// Returns if the text direction for a given line is RTL
     /// Returns `None` if the line doesn't exist or hasn't been shaped yet.
     pub fn is_rtl(&self, line: usize) -> Option<bool> {
-        self.lines.get(line)?.shape_opt().map(|shape| shape.rtl)
+        self.line(line)?.shape_opt().map(|shape| shape.rtl)
     }
 
     /// Apply a [`Motion`] to a [`Cursor`]
@@ -1349,7 +1435,7 @@ impl Buffer {
                 }
             }
             Motion::Previous => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 if cursor.index > 0 {
                     // Find previous character index
                     let mut prev_index = 0;
@@ -1365,13 +1451,13 @@ impl Buffer {
                     cursor.affinity = Affinity::After;
                 } else if cursor.line > 0 {
                     cursor.line -= 1;
-                    cursor.index = self.lines.get(cursor.line)?.text().len();
+                    cursor.index = self.line(cursor.line)?.text().len();
                     cursor.affinity = Affinity::After;
                 }
                 cursor_x_opt = None;
             }
             Motion::Next => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 if cursor.index < line.text().len() {
                     for (i, c) in line.text().grapheme_indices(true) {
                         if i == cursor.index {
@@ -1380,7 +1466,7 @@ impl Buffer {
                             break;
                         }
                     }
-                } else if cursor.line + 1 < self.lines.len() {
+                } else if cursor.line + 1 < self.line_count() {
                     cursor.line += 1;
                     cursor.index = 0;
                     cursor.affinity = Affinity::Before;
@@ -1463,7 +1549,7 @@ impl Buffer {
 
                 if layout_cursor.layout + 1 < layout_len {
                     layout_cursor.layout += 1;
-                } else if layout_cursor.line + 1 < self.lines.len() {
+                } else if layout_cursor.line + 1 < self.line_count() {
                     layout_cursor.line += 1;
                     layout_cursor.layout = 0;
                 }
@@ -1484,7 +1570,7 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::SoftHome => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 cursor.index = line
                     .text()
                     .char_indices()
@@ -1493,7 +1579,7 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::End => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 cursor.index = line.text().len();
                 cursor_x_opt = None;
             }
@@ -1502,7 +1588,7 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::ParagraphEnd => {
-                cursor.index = self.lines.get(cursor.line)?.text().len();
+                cursor.index = self.line(cursor.line)?.text().len();
                 cursor_x_opt = None;
             }
             Motion::PageUp => {
@@ -1549,7 +1635,7 @@ impl Buffer {
                 }
             }
             Motion::PreviousWord => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 if cursor.index > 0 {
                     cursor.index = line
                         .text()
@@ -1560,12 +1646,12 @@ impl Buffer {
                         .unwrap_or(0);
                 } else if cursor.line > 0 {
                     cursor.line -= 1;
-                    cursor.index = self.lines.get(cursor.line)?.text().len();
+                    cursor.index = self.line(cursor.line)?.text().len();
                 }
                 cursor_x_opt = None;
             }
             Motion::NextWord => {
-                let line = self.lines.get(cursor.line)?;
+                let line = self.line(cursor.line)?;
                 if cursor.index < line.text().len() {
                     cursor.index = line
                         .text()
@@ -1573,7 +1659,7 @@ impl Buffer {
                         .map(|(i, word)| i + word.len())
                         .find(|&i| i > cursor.index)
                         .unwrap_or_else(|| line.text().len());
-                } else if cursor.line + 1 < self.lines.len() {
+                } else if cursor.line + 1 < self.line_count() {
                     cursor.line += 1;
                     cursor.index = 0;
                 }
@@ -1629,8 +1715,8 @@ impl Buffer {
                 cursor_x_opt = None;
             }
             Motion::BufferEnd => {
-                cursor.line = self.lines.len().saturating_sub(1);
-                cursor.index = self.lines.get(cursor.line)?.text().len();
+                cursor.line = self.line_count().saturating_sub(1);
+                cursor.index = self.line(cursor.line)?.text().len();
                 cursor_x_opt = None;
             }
             Motion::GotoLine(line) => {
