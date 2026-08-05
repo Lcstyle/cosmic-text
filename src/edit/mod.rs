@@ -237,7 +237,7 @@ pub trait Edit<'buffer> {
                 Selection::Line(select) => {
                     let start_line = cmp::min(select.line, cursor.line);
                     let end_line = cmp::max(select.line, cursor.line);
-                    let end_index = buffer.lines[end_line].text().len();
+                    let end_index = buffer.line(end_line).expect("line index in bounds").text().len();
                     Some((Cursor::new(start_line, 0), Cursor::new(end_line, end_index)))
                 }
                 Selection::Word(select) => {
@@ -257,7 +257,7 @@ pub trait Edit<'buffer> {
 
                     // Move start to beginning of word
                     {
-                        let line = &buffer.lines[start.line];
+                        let line = buffer.line(start.line).expect("line index in bounds");
                         start.index = line
                             .text()
                             .unicode_word_indices()
@@ -269,7 +269,7 @@ pub trait Edit<'buffer> {
 
                     // Move end to end of word
                     {
-                        let line = &buffer.lines[end.line];
+                        let line = buffer.line(end.line).expect("line index in bounds");
                         end.index = line
                             .text()
                             .unicode_word_indices()

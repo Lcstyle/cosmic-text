@@ -132,7 +132,7 @@ impl<'buffer> Editor<'buffer> {
                     Some((start_line, end_line, left, right))
                         if line_i >= start_line && line_i <= end_line =>
                     {
-                        let text = buffer.lines[line_i].text();
+                        let text = buffer.line(line_i).expect("line index in bounds").text();
                         let l = block_clamp_col(text, left);
                         let r = cmp::max(l, block_clamp_col(text, right));
                         Some((Cursor::new(line_i, l), Cursor::new(line_i, r)))
@@ -295,10 +295,13 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             // Delete the selection from the last line
             let end_line_opt = if end.line > start.line {
                 // Get part of line after selection
-                let after = buffer.lines[end.line].split_off(end.index);
+                let after = buffer
+                    .line_mut(end.line)
+                    .expect("line index in bounds")
+                    .split_off(end.index);
 
                 // Remove end line
-                let removed = buffer.lines.remove(end.line);
+                let removed = buffer.remove_line(end.line);
                 change_lines.insert(0, removed);
 
                 Some(after)
@@ -308,13 +311,13 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
 
             // Delete interior lines (in reverse for safety)
             for line_i in (start.line + 1..end.line).rev() {
-                let removed = buffer.lines.remove(line_i);
+                let removed = buffer.remove_line(line_i);
                 change_lines.insert(0, removed);
             }
 
             // Delete the selection from the first line
             {
-                let line = &mut buffer.lines[start.line];
+                let line = buffer.line_mut(start.line).expect("line index in bounds");
 
                 // Get part after selection if start line is also end line
                 let after_opt = if start.line == end.line {
@@ -381,10 +384,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             let start = cursor;
 
             // Ensure there are enough lines in the buffer to handle this cursor
-            while cursor.line >= buffer.lines.len() {
+            while cursor.line >= buffer.line_count() {
                 // Get last line ending
                 let mut last_ending = LineEnding::None;
-                if let Some(last_line) = buffer.lines.last_mut() {
+                if let Some(last_line) = buffer.last_line_mut() {
                     last_ending = last_line.ending();
                     // Ensure a valid line ending is always set on interior lines
                     if last_ending == LineEnding::None {
@@ -397,7 +400,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     AttrsList::new(&attrs_list.as_ref().map_or_else(
                         || {
                             buffer
-                                .lines
+                                .lines_iter()
                                 .last()
                                 .map_or_else(Attrs::new, |line| line.attrs_list().defaults())
                         },
@@ -405,10 +408,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     )),
                     Shaping::Advanced,
                 );
-                buffer.lines.push(line);
+                buffer.push_line(line);
             }
 
-            let line: &mut BufferLine = &mut buffer.lines[cursor.line];
+            let line: &mut BufferLine = buffer.line_mut(cursor.line).expect("cursor line in bounds");
             let insert_line = cursor.line + 1;
 
             // Collect text after insertion as a line
@@ -452,7 +455,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     Shaping::Advanced,
                 );
                 tmp.append(&after);
-                buffer.lines.insert(insert_line, tmp);
+                buffer.insert_line(insert_line, tmp);
                 cursor.line += 1;
             } else {
                 line.append(&after);
@@ -467,14 +470,15 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     final_attrs.split_off(remaining_split_len),
                     Shaping::Advanced,
                 );
-                buffer.lines.insert(insert_line, tmp);
+                buffer.insert_line(insert_line, tmp);
                 cursor.line += 1;
             }
 
             assert_eq!(remaining_split_len, 0);
 
             // Append the text after insertion
-            cursor.index = buffer.lines[cursor.line].text().len() - after_len;
+            cursor.index =
+                buffer.line(cursor.line).expect("cursor line in bounds").text().len() - after_len;
 
             ChangeItem {
                 start,
@@ -501,7 +505,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     if line_i > start_line {
                         selection.push('\n');
                     }
-                    let text = buffer.lines[line_i].text();
+                    let text = buffer.line(line_i).expect("line index in bounds").text();
                     let l = block_clamp_col(text, left);
                     let r = cmp::max(l, block_clamp_col(text, right));
                     selection.push_str(&text[l..r]);
@@ -515,25 +519,27 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             let mut selection = String::new();
             // Take the selection from the first line
             {
+                let text = buffer.line(start.line).expect("line index in bounds").text();
                 // Add selected part of line to string
                 if start.line == end.line {
-                    selection.push_str(&buffer.lines[start.line].text()[start.index..end.index]);
+                    selection.push_str(&text[start.index..end.index]);
                 } else {
-                    selection.push_str(&buffer.lines[start.line].text()[start.index..]);
+                    selection.push_str(&text[start.index..]);
                     selection.push('\n');
                 }
             }
 
             // Take the selection from all interior lines (if they exist)
             for line_i in start.line + 1..end.line {
-                selection.push_str(buffer.lines[line_i].text());
+                selection.push_str(buffer.line(line_i).expect("line index in bounds").text());
                 selection.push('\n');
             }
 
             // Take the selection from the last line
             if end.line > start.line {
                 // Add selected part of line to string
-                selection.push_str(&buffer.lines[end.line].text()[..end.index]);
+                let text = buffer.line(end.line).expect("line index in bounds").text();
+                selection.push_str(&text[..end.index]);
             }
 
             Some(selection)
@@ -549,7 +555,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             // line, so it does not shift the byte indices of the other rows.
             for line_i in start_line..=end_line {
                 let (l, r) = self.with_buffer(|buffer| {
-                    let text = buffer.lines[line_i].text();
+                    let text = buffer.line(line_i).expect("line index in bounds").text();
                     let l = block_clamp_col(text, left);
                     let r = cmp::max(l, block_clamp_col(text, right));
                     (l, r)
@@ -561,7 +567,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
 
             // Collapse cursor to the top-left corner and clear the selection.
             let start_col = self.with_buffer(|buffer| {
-                block_clamp_col(buffer.lines[start_line].text(), left)
+                block_clamp_col(
+                    buffer.line(start_line).expect("line index in bounds").text(),
+                    left,
+                )
             });
             self.cursor = Cursor::new(start_line, start_col);
             self.selection = Selection::None;
@@ -655,7 +664,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                 if self.auto_indent {
                     let mut string = String::from("\n");
                     self.with_buffer(|buffer| {
-                        let line = &buffer.lines[self.cursor.line];
+                        let line = buffer.line(self.cursor.line).expect("cursor line in bounds");
                         let text = line.text();
                         for c in text.chars() {
                             if c.is_whitespace() {
@@ -686,7 +695,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     if self.cursor.index > 0 {
                         // Move cursor to previous character index
                         self.cursor.index = self.with_buffer(|buffer| {
-                            buffer.lines[self.cursor.line].text()[..self.cursor.index]
+                            buffer.line(self.cursor.line).expect("cursor line in bounds").text()
+                                [..self.cursor.index]
                                 .char_indices()
                                 .next_back()
                                 .map_or(0, |(i, _)| i)
@@ -694,8 +704,13 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     } else if self.cursor.line > 0 {
                         // Move cursor to previous line
                         self.cursor.line -= 1;
-                        self.cursor.index =
-                            self.with_buffer(|buffer| buffer.lines[self.cursor.line].text().len());
+                        self.cursor.index = self.with_buffer(|buffer| {
+                            buffer
+                                .line(self.cursor.line)
+                                .expect("cursor line in bounds")
+                                .text()
+                                .len()
+                        });
                     }
 
                     if self.cursor != end {
@@ -713,9 +728,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     let mut end = self.cursor;
 
                     self.with_buffer(|buffer| {
-                        if start.index < buffer.lines[start.line].text().len() {
-                            let line = &buffer.lines[start.line];
-
+                        let line = buffer.line(start.line).expect("cursor line in bounds");
+                        if start.index < line.text().len() {
                             let range_opt = line
                                 .text()
                                 .grapheme_indices(true)
@@ -727,7 +741,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                                 start.index = range.start;
                                 end.index = range.end;
                             }
-                        } else if start.line + 1 < buffer.lines.len() {
+                        } else if start.line + 1 < buffer.line_count() {
                             end.line += 1;
                             end.index = 0;
                         }
@@ -753,7 +767,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     let mut after_whitespace = 0;
                     let mut required_indent = 0;
                     self.with_buffer(|buffer| {
-                        let line = &buffer.lines[line_i];
+                        let line = buffer.line(line_i).expect("line index in bounds");
                         let text = line.text();
 
                         if self.selection == Selection::None {
@@ -826,7 +840,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     let mut last_indent = 0;
                     let mut after_whitespace = 0;
                     self.with_buffer(|buffer| {
-                        let line = &buffer.lines[line_i];
+                        let line = buffer.line(line_i).expect("line index in bounds");
                         let text = line.text();
                         // Default to end of line if no non-whitespace found
                         after_whitespace = text.len();

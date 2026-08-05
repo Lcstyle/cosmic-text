@@ -78,7 +78,7 @@ impl<'syntax_system, 'buffer> SyntaxEditor<'syntax_system, 'buffer> {
 
                 // Reset attrs to match default foreground and no highlighting
                 self.with_buffer_mut(|buffer| {
-                    for line in buffer.lines.iter_mut() {
+                    for line in buffer.lines_iter_mut() {
                         let mut attrs = line.attrs_list().defaults();
                         if let Some(foreground) = self.theme.settings.foreground {
                             attrs = attrs.color(Color::rgba(
@@ -320,13 +320,13 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
             let scroll_end = scroll.vertical + buffer.size().1.unwrap_or(f32::INFINITY);
             let mut total_height = 0.0;
             let mut highlighted = 0;
-            for line_i in 0..buffer.lines.len() {
+            for line_i in 0..buffer.line_count() {
                 // Break out if we have reached the end of scroll and are past the cursor
                 if total_height > scroll_end && line_i > cursor.line {
                     break;
                 }
 
-                let line = &mut buffer.lines[line_i];
+                let line = buffer.line_mut(line_i).expect("line index in bounds");
                 if line.metadata().is_some() && line_i < self.syntax_cache.len() {
                     //TODO: duplicated code!
                     if line_i >= scroll.line && total_height < scroll_end {
@@ -419,12 +419,15 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
                 if line_i < self.syntax_cache.len() {
                     if self.syntax_cache[line_i] != cache_item {
                         self.syntax_cache[line_i] = cache_item;
-                        if line_i + 1 < buffer.lines.len() {
-                            buffer.lines[line_i + 1].reset();
+                        if line_i + 1 < buffer.line_count() {
+                            buffer.line_mut(line_i + 1).expect("line index in bounds").reset();
                         }
                     }
                 } else {
-                    buffer.lines[line_i].set_metadata(self.syntax_cache.len());
+                    buffer
+                        .line_mut(line_i)
+                        .expect("line index in bounds")
+                        .set_metadata(self.syntax_cache.len());
                     self.syntax_cache.push(cache_item);
                 }
             }
