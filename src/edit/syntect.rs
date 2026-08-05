@@ -76,6 +76,16 @@ impl<'syntax_system, 'buffer> SyntaxEditor<'syntax_system, 'buffer> {
                 self.highlighter = Highlighter::new(theme);
                 self.syntax_cache.clear();
 
+                // A rope-backed buffer skips the attrs reset: its lines carry
+                // no highlight spans (the highlight pass skips ropes) and no
+                // baked-in foreground color, so the new theme's colors reach
+                // the glyphs through the draw-time defaults instead — and the
+                // store forbids line mutation before thaw anyway.
+                #[cfg(feature = "rope-buffer")]
+                if self.with_buffer(|buffer| buffer.is_rope()) {
+                    return true;
+                }
+
                 // Reset attrs to match default foreground and no highlighting
                 self.with_buffer_mut(|buffer| {
                     for line in buffer.lines_iter_mut() {
@@ -310,6 +320,17 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
     }
 
     fn shape_as_needed(&mut self, font_system: &mut FontSystem, prune: bool) {
+        // A rope-backed buffer skips the highlight pass entirely: highlighting
+        // walks parse state sequentially from line 0 and mutates lines, both
+        // unavailable (and unaffordable) before the store thaws. Shaping goes
+        // through Editor, whose shape_until_* rope arms are correct;
+        // highlighting resumes when the first edit thaws the buffer.
+        #[cfg(feature = "rope-buffer")]
+        if self.with_buffer(|buffer| buffer.is_rope()) {
+            self.editor.shape_as_needed(font_system, prune);
+            return;
+        }
+
         #[cfg(feature = "std")]
         let now = std::time::Instant::now();
 
@@ -500,5 +521,60 @@ impl BorrowedWithFontSystem<'_, SyntaxEditor<'_, '_>> {
         F: FnMut(i32, i32, u32, u32, Color),
     {
         self.inner.draw(self.font_system, cache, f);
+    }
+}
+
+#[cfg(all(test, feature = "rope-buffer", feature = "std"))]
+mod rope_tests {
+    use super::*;
+    use crate::{Attrs, Buffer, Metrics, RopeStore};
+
+    fn rope_syntax_editor(
+        syntax_system: &SyntaxSystem,
+        lines: usize,
+    ) -> SyntaxEditor<'_, 'static> {
+        let text: String = (0..lines).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        let store = RopeStore::from_text(&text, &Attrs::new(), Shaping::Advanced);
+        let mut buffer = Buffer::new_rope(Metrics::new(14.0, 20.0), store);
+        buffer.set_size(Some(800.0), Some(600.0));
+        SyntaxEditor::new(buffer, syntax_system, "base16-eighties.dark")
+            .expect("default theme exists")
+    }
+
+    #[test]
+    fn shape_as_needed_skips_highlight_on_rope() {
+        let syntax_system = SyntaxSystem::new();
+        let mut font_system = FontSystem::new();
+        let mut editor = rope_syntax_editor(&syntax_system, 5_000);
+
+        // Regression: the highlight pass used to call line_mut on the rope
+        // store and abort with "rope store mutated without thaw".
+        editor.shape_as_needed(&mut font_system, true);
+
+        assert!(editor.with_buffer(|buffer| buffer.is_rope()));
+        let first_run = editor.with_buffer(|buffer| {
+            buffer
+                .layout_runs()
+                .next()
+                .map(|run| (run.line_i, run.text.to_string()))
+        });
+        assert_eq!(
+            first_run,
+            Some((0, "fn f0() {}".to_string())),
+            "shaping must still happen through Editor's rope arms"
+        );
+    }
+
+    #[test]
+    fn update_theme_on_rope_does_not_panic() {
+        let syntax_system = SyntaxSystem::new();
+        let mut editor = rope_syntax_editor(&syntax_system, 100);
+
+        // Regression: the per-line attrs reset used to call lines_iter_mut
+        // on the rope store and abort.
+        assert!(editor.update_theme("base16-ocean.light"));
+
+        assert!(editor.with_buffer(|buffer| buffer.is_rope()));
+        assert!(!editor.update_theme("no-such-theme"));
     }
 }
