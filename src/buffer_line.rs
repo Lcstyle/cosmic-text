@@ -9,6 +9,18 @@ use crate::{
     LayoutRunIter, LineEnding, ShapeLine, Shaping, Wrap,
 };
 
+/// Maximum number of bytes of a single line that are ever shaped.
+///
+/// Shaping is O(line length) with large constants (per-glyph allocation), and
+/// it runs synchronously inside widget layout on the UI thread. A minified
+/// single-line file (a 12 MB Ghost JSON export was the live case) would
+/// otherwise freeze the application for minutes and allocate gigabytes. The
+/// cap bounds SHAPING ONLY — the stored document text is never touched, so
+/// editing, saving, and copying see the whole line. Glyphs past the cap
+/// simply do not render, matching how other editors degrade on degenerate
+/// lines. 32 KiB of monospace is ~65 screens of horizontal scroll at 4K.
+pub const MAX_SHAPE_BYTES: usize = 32 * 1024;
+
 /// A line (or paragraph) of text that is shaped and laid out
 #[derive(Clone, Debug)]
 pub struct BufferLine {
@@ -228,9 +240,26 @@ impl BufferLine {
                 .shape_opt
                 .take_unused()
                 .unwrap_or_else(ShapeLine::empty);
+            // Bound shaping cost for degenerate single-line files; the
+            // document text itself is untouched. See MAX_SHAPE_BYTES.
+            let shape_text = if self.text.len() > MAX_SHAPE_BYTES {
+                let mut end = MAX_SHAPE_BYTES;
+                while !self.text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                #[cfg(feature = "std")]
+                log::warn!(
+                    "line is {} bytes; shaping capped at {} (text is intact, glyphs past the cap do not render)",
+                    self.text.len(),
+                    end
+                );
+                &self.text[..end]
+            } else {
+                &self.text[..]
+            };
             line.build(
                 font_system,
-                &self.text,
+                shape_text,
                 &self.attrs_list,
                 self.shaping,
                 tab_width,

@@ -375,9 +375,23 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
                         (ParseState::new(self.syntax), ScopeStack::new())
                     };
                 let mut highlight_state = HighlightState::new(&self.highlighter, scope_stack);
-                let ops = parse_state
-                    .parse_line(line.text(), &self.syntax_system.syntax_set)
-                    .expect("failed to parse syntax");
+                // Same invariant as the shaping cap in BufferLine::shape: an
+                // over-long line must not be processed unboundedly on the UI
+                // thread. Skipping the parse leaves `parse_state` untouched,
+                // so the sequential syntax-state chain passes through this
+                // line unchanged and later lines still highlight.
+                let ops = if line.text().len() > crate::MAX_SHAPE_BYTES {
+                    log::warn!(
+                        "line {line_i} is {} bytes; skipping syntax highlighting (cap {})",
+                        line.text().len(),
+                        crate::MAX_SHAPE_BYTES
+                    );
+                    Vec::new()
+                } else {
+                    parse_state
+                        .parse_line(line.text(), &self.syntax_system.syntax_set)
+                        .expect("failed to parse syntax")
+                };
                 let ranges = RangedHighlightIterator::new(
                     &mut highlight_state,
                     &ops,

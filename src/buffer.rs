@@ -2267,6 +2267,64 @@ impl BorrowedWithFontSystem<'_, Buffer> {
     }
 }
 
+#[cfg(all(test, feature = "std"))]
+mod long_line_tests {
+    use super::{Buffer, Metrics};
+    use crate::{Attrs, Shaping, MAX_SHAPE_BYTES};
+
+    /// Regression net for the single-giant-line freeze (Ghost-export JSON:
+    /// 12 MB, zero newlines). Shaping cost must be bounded per line no matter
+    /// how long the line is — and the cap must never touch the document text.
+    #[test]
+    fn giant_single_line_shaping_is_capped() {
+        let mut font_system = crate::FontSystem::new();
+        let unit = r#"{"key":"value","n":12345},"#;
+        let text: String = unit.repeat(8 * 1024); // ~208 KB, one line, no newlines
+        assert!(text.len() > MAX_SHAPE_BYTES * 6);
+
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_size(Some(800.0), Some(600.0));
+        buffer.set_text(&text, &Attrs::new(), Shaping::Advanced, None);
+
+        let layout = buffer.line_layout(&mut font_system, 0).expect("layout of line 0");
+        let max_end = layout
+            .iter()
+            .flat_map(|line| line.glyphs.iter())
+            .map(|glyph| glyph.end)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_end <= MAX_SHAPE_BYTES,
+            "glyphs extend to byte {max_end}, shaping cap is {MAX_SHAPE_BYTES}"
+        );
+        // The cap bounds SHAPING only; the document itself stays whole.
+        assert_eq!(buffer.line(0).expect("line 0").text().len(), text.len());
+    }
+
+    /// The cap must not split a multi-byte character.
+    #[test]
+    fn shape_cap_snaps_to_char_boundary() {
+        let mut font_system = crate::FontSystem::new();
+        // 3-byte chars ensure the cap lands mid-char unless snapped.
+        let text: String = "€".repeat(MAX_SHAPE_BYTES / 3 + 64);
+
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_size(Some(800.0), Some(600.0));
+        buffer.set_text(&text, &Attrs::new(), Shaping::Advanced, None);
+
+        // Must not panic on a non-boundary slice.
+        let layout = buffer.line_layout(&mut font_system, 0).expect("layout of line 0");
+        let max_end = layout
+            .iter()
+            .flat_map(|line| line.glyphs.iter())
+            .map(|glyph| glyph.end)
+            .max()
+            .unwrap_or(0);
+        assert!(max_end <= MAX_SHAPE_BYTES);
+        assert_eq!(text.len() % 3, 0);
+    }
+}
+
 #[cfg(all(test, feature = "rope-buffer", feature = "std"))]
 mod rope_arm_tests {
     use super::{Buffer, Metrics};
