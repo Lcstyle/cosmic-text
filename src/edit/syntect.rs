@@ -321,10 +321,11 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
 
     fn shape_as_needed(&mut self, font_system: &mut FontSystem, prune: bool) {
         // A rope-backed buffer skips the highlight pass entirely: highlighting
-        // walks parse state sequentially from line 0 and mutates lines, both
-        // unavailable (and unaffordable) before the store thaws. Shaping goes
-        // through Editor, whose shape_until_* rope arms are correct;
-        // highlighting resumes when the first edit thaws the buffer.
+        // walks parse state sequentially from line 0 and mutates lines —
+        // O(file) work the rope path exists to avoid. Rope buffers are never
+        // highlighted: editing is rope-native and no longer thaws the store.
+        // Shaping goes through Editor, whose shape_until_* rope arms are
+        // correct.
         #[cfg(feature = "rope-buffer")]
         if self.with_buffer(|buffer| buffer.is_rope()) {
             self.editor.shape_as_needed(font_system, prune);
