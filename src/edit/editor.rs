@@ -533,14 +533,26 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     selection.push_str(&text[start.index..end.index]);
                 } else {
                     selection.push_str(&text[start.index..]);
-                    selection.push('\n');
+                    // The line's REAL ending: zero bytes for a display chunk
+                    // (LineEnding::None), CRLF preserved for CRLF documents.
+                    selection.push_str(
+                        buffer
+                            .line(start.line)
+                            .map(|line| line.ending().as_str())
+                            .unwrap_or("\n"),
+                    );
                 }
             }
 
             // Take the selection from all interior lines (if they exist)
             for line_i in start.line + 1..end.line {
                 selection.push_str(&buffer.line_text_cow(line_i).expect("line index in bounds"));
-                selection.push('\n');
+                selection.push_str(
+                    buffer
+                        .line(line_i)
+                        .map(|line| line.ending().as_str())
+                        .unwrap_or("\n"),
+                );
             }
 
             // Take the selection from the last line

@@ -1344,24 +1344,58 @@ impl Buffer {
         alignment: Option<Align>,
     ) {
         let mut line_count = 0;
+        let mut chunk_splits = 0usize;
         for (range, ending) in LineIter::new(text) {
-            let line_text = &text[range];
-            if line_count < self.line_count() {
-                // Reuse existing line: reclaim String/AttrsList allocations
-                let line = self.line_mut(line_count).expect("line index in bounds");
-                let mut reused_text = line.reclaim_text();
-                reused_text.push_str(line_text);
-                let reused_attrs = line.reclaim_attrs().reset(attrs);
-                line.reset_new(reused_text, ending, reused_attrs, shaping);
-            } else {
-                self.push_line(BufferLine::new(
-                    line_text,
-                    ending,
-                    AttrsList::new(attrs),
-                    shaping,
-                ));
+            // Display-split over-long lines into MAX_SHAPE_BYTES chunks joined
+            // by LineEnding::None. None contributes zero bytes on
+            // reconstruction, so the document stays byte-exact for save and
+            // copy, while layout, scrolling and the scrollbar see ordinary
+            // bounded lines instead of one unshapeable monster (the live case:
+            // a 12MB single-line Ghost JSON export).
+            let mut start = range.start;
+            let end = range.end;
+            loop {
+                let remaining = end - start;
+                let (chunk_end, chunk_ending) = if remaining > crate::MAX_SHAPE_BYTES {
+                    let mut ce = start + crate::MAX_SHAPE_BYTES;
+                    while !text.is_char_boundary(ce) {
+                        ce -= 1;
+                    }
+                    (ce, LineEnding::None)
+                } else {
+                    (end, ending)
+                };
+                let line_text = &text[start..chunk_end];
+                if line_count < self.line_count() {
+                    // Reuse existing line: reclaim String/AttrsList allocations
+                    let line = self.line_mut(line_count).expect("line index in bounds");
+                    let mut reused_text = line.reclaim_text();
+                    reused_text.push_str(line_text);
+                    let reused_attrs = line.reclaim_attrs().reset(attrs);
+                    line.reset_new(reused_text, chunk_ending, reused_attrs, shaping);
+                } else {
+                    self.push_line(BufferLine::new(
+                        line_text,
+                        chunk_ending,
+                        AttrsList::new(attrs),
+                        shaping,
+                    ));
+                }
+                line_count += 1;
+                if chunk_end >= end {
+                    break;
+                }
+                chunk_splits += 1;
+                start = chunk_end;
             }
-            line_count += 1;
+        }
+        #[cfg(feature = "std")]
+        if chunk_splits > 0 {
+            log::warn!(
+                "over-long line(s) display-split into {} extra chunks of at most {} bytes (document bytes unchanged)",
+                chunk_splits,
+                crate::MAX_SHAPE_BYTES
+            );
         }
 
         // Ensure there is an ending line with no line ending.
@@ -2297,8 +2331,66 @@ mod long_line_tests {
             max_end <= MAX_SHAPE_BYTES,
             "glyphs extend to byte {max_end}, shaping cap is {MAX_SHAPE_BYTES}"
         );
-        // The cap bounds SHAPING only; the document itself stays whole.
-        assert_eq!(buffer.line(0).expect("line 0").text().len(), text.len());
+        // The giant line is display-chunked; the DOCUMENT stays byte-exact
+        // when reconstructed from line text + real endings.
+        let mut reconstructed = String::new();
+        for i in 0..buffer.line_count() {
+            let line = buffer.line(i).expect("line index in bounds");
+            reconstructed.push_str(line.text());
+            reconstructed.push_str(line.ending().as_str());
+        }
+        assert_eq!(reconstructed, text);
+    }
+
+    /// Over-long lines are split into display chunks joined by
+    /// `LineEnding::None`, so every byte of the document is reachable by
+    /// ordinary scrolling while reconstruction stays byte-exact.
+    #[test]
+    fn over_long_lines_are_display_chunked_byte_exactly() {
+        let mut giant = String::new();
+        for i in 0..30_000 {
+            giant.push_str(&format!("{{\"n\":{i},\"k\":\"v€\"}},"));
+        }
+        let text = format!("{giant}\nshort tail line");
+
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_text(&text, &Attrs::new(), Shaping::Advanced, None);
+
+        let lines = buffer.line_count();
+        assert!(lines > 3, "giant line must be chunked, got {lines} lines");
+        let mut reconstructed = String::new();
+        for i in 0..lines {
+            let line = buffer.line(i).expect("line index in bounds");
+            assert!(
+                line.text().len() <= MAX_SHAPE_BYTES,
+                "chunk {i} is {} bytes",
+                line.text().len()
+            );
+            reconstructed.push_str(line.text());
+            reconstructed.push_str(line.ending().as_str());
+        }
+        assert_eq!(reconstructed, text, "chunking must preserve bytes exactly");
+    }
+
+    /// Copying a selection that spans a chunk boundary must reproduce the
+    /// document bytes — LineEnding::None contributes nothing, no fake '\n'.
+    #[test]
+    fn copy_across_chunk_boundary_adds_no_fake_newline() {
+        use crate::{Cursor, Edit, Editor, Selection};
+        let giant: String = "abcdefgh".repeat(3 * MAX_SHAPE_BYTES / 8);
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_text(&giant, &Attrs::new(), Shaping::Advanced, None);
+        assert!(buffer.line_count() >= 3, "expected 3 chunks");
+
+        let mut editor = Editor::new(buffer);
+        editor.set_selection(Selection::Normal(Cursor::new(0, 10)));
+        editor.set_cursor(Cursor::new(1, 10));
+        let copied = editor.copy_selection().expect("copy");
+        // Chunk 0 is exactly MAX_SHAPE_BYTES (ASCII), so the selection is
+        // document bytes [10 .. MAX_SHAPE_BYTES + 10].
+        let expected = &giant[10..MAX_SHAPE_BYTES + 10];
+        assert_eq!(copied.len(), expected.len(), "no fake newline inserted");
+        assert_eq!(&copied, expected);
     }
 
     /// The cap must not split a multi-byte character.
