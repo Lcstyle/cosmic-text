@@ -348,10 +348,15 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
                     break;
                 }
 
+                // Hidden (folded-away) lines still parse — the sequential
+                // syntax-state chain must pass through them — but they are
+                // never laid out and contribute no height, matching
+                // shape_until_scroll's accounting.
+                let hidden = buffer.line_hidden(line_i);
                 let line = buffer.line_mut(line_i).expect("line index in bounds");
                 if line.metadata().is_some() && line_i < self.syntax_cache.len() {
                     //TODO: duplicated code!
-                    if line_i >= scroll.line && total_height < scroll_end {
+                    if line_i >= scroll.line && total_height < scroll_end && !hidden {
                         // Perform shaping and layout of this line in order to count if we have reached scroll
                         match buffer.line_layout(font_system, line_i) {
                             Some(layout_lines) => {
@@ -437,7 +442,7 @@ impl<'buffer> Edit<'buffer> for SyntaxEditor<'_, 'buffer> {
                 line.set_attrs_list(attrs_list);
 
                 // Perform shaping and layout of this line in order to count if we have reached scroll
-                if line_i >= scroll.line && total_height < scroll_end {
+                if line_i >= scroll.line && total_height < scroll_end && !hidden {
                     match buffer.line_layout(font_system, line_i) {
                         Some(layout_lines) => {
                             for layout_line in layout_lines.iter() {
