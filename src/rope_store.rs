@@ -219,7 +219,14 @@ impl RopeStore {
             self.metadata.shift_lines(line + 1, delta);
         }
         self.metadata.set_line_ending(line, LineEnding::None);
-        if delta > 0 && ending_override != LineEnding::None {
+        // Migrate the override only for a clean intra-line split
+        // (mapped == line): there the tail line really does carry the
+        // original terminator bytes. When the terminator itself was cloven
+        // (insert between the \r and \n of a CRLF: mapped == line + 1) or
+        // fused (CR|LF merge: mapped < line), NO surviving line carries the
+        // original ending — bytes are truth, migrating would corrupt
+        // serialization.
+        if delta > 0 && mapped == line && ending_override != LineEnding::None {
             self.metadata
                 .set_line_ending(line + delta as usize, ending_override);
         }
@@ -465,6 +472,23 @@ mod tests {
     fn materialize_out_of_bounds() {
         let mut s = store("a\nb");
         assert!(s.materialize(2).is_none());
+    }
+
+    /// Inserting between the \r and \n of a CRLF cleaves the terminator
+    /// itself: the head keeps \r, the tail gets \n, and NO surviving line
+    /// carries the original CrLf ending. A stale metadata override must not
+    /// be migrated onto any of them — bytes are truth, and reconstruction
+    /// must stay byte-exact.
+    #[test]
+    fn crlf_split_insert_does_not_migrate_ending_override() {
+        let mut s = store("head\r\nnext\n");
+        // A stale CrLf override on the line whose bytes currently agree.
+        s.metadata.set_line_ending(0, LineEnding::CrLf);
+
+        // Split the CRLF: "head\r" | "X\nY" | "\nnext\n"
+        s.insert_text(0, 5, "X\nY");
+
+        assert_eq!(reconstruct(&mut s), "head\rX\nY\nnext\n");
     }
 
     #[test]

@@ -607,8 +607,9 @@ impl Buffer {
         end_cursor.line = end.0;
         end_cursor.index = end.1;
         // The store did targeted invalidation; TEXT_SET makes resolve_dirty
-        // report work without clearing the caches wholesale (its rope arm
-        // skips the cache-clearing branches on TEXT_SET by design).
+        // report work. It does NOT suppress geometry cache-clears — a resize
+        // or wrap change landing in the same frame as this edit must still
+        // drop stale layout for un-edited lines.
         self.dirty |= DirtyFlags::TEXT_SET;
         self.redraw = true;
         Some((recorded_start, end_cursor))
@@ -837,14 +838,17 @@ impl Buffer {
                 // `line_mut` access without thaw), so no per-line scan.
                 return false;
             }
-            if !dirty.contains(DirtyFlags::TEXT_SET) {
-                if dirty.contains(DirtyFlags::DIRECTION) || dirty.contains(DirtyFlags::TAB_SHAPE) {
-                    // Reshape implies relayout: drop both caches. Cheaper than
-                    // scanning millions of rope lines for affected ones.
-                    store.cache.clear();
-                } else if dirty.contains(DirtyFlags::RELAYOUT) {
-                    store.cache.clear_layout();
-                }
+            // Geometry flags clear caches UNCONDITIONALLY — do not gate on
+            // TEXT_SET. Since native rope edits, TEXT_SET arrives with warm
+            // caches (the edit did targeted per-line invalidation), so an
+            // edit plus a resize/zoom/wrap change in the same frame must
+            // still drop the stale geometry-dependent entries.
+            if dirty.contains(DirtyFlags::DIRECTION) || dirty.contains(DirtyFlags::TAB_SHAPE) {
+                // Reshape implies relayout: drop both caches. Cheaper than
+                // scanning millions of rope lines for affected ones.
+                store.cache.clear();
+            } else if dirty.contains(DirtyFlags::RELAYOUT) {
+                store.cache.clear_layout();
             }
             self.redraw = true;
             self.dirty = DirtyFlags::empty();
@@ -2599,6 +2603,47 @@ mod rope_arm_tests {
         for pair in line_indices.windows(2) {
             assert_eq!(pair[1], pair[0] + 1);
         }
+    }
+
+    /// A native edit (TEXT_SET) and a geometry change (RELAYOUT) in the same
+    /// frame: the geometry flag must still clear the layout cache. In Phase B
+    /// TEXT_SET implied cold caches (set_text rebuilt everything); native
+    /// edits set TEXT_SET with warm caches, so an un-edited line's cached
+    /// wide layout must not survive a width change.
+    #[test]
+    fn same_frame_edit_and_resize_relayouts_unedited_rope_lines() {
+        let mut font_system = FontSystem::new();
+        let long = "word ".repeat(60);
+        let store = RopeStore::from_text(
+            &format!("{long}\nsecond"),
+            &Attrs::new(),
+            Shaping::Advanced,
+        );
+        let mut buffer = Buffer::new_rope(Metrics::new(14.0, 20.0), store);
+
+        // Wide: line 0 lays out as a single layout line; cache it.
+        buffer.set_size(Some(100_000.0), Some(600.0));
+        let wide_lines = buffer
+            .line_layout(&mut font_system, 0)
+            .expect("layout of line 0")
+            .len();
+        assert_eq!(wide_lines, 1, "wide layout must not wrap");
+
+        // Same frame: native edit on a DIFFERENT line + a width change,
+        // then the per-frame pipeline (shape_until_scroll is the sole
+        // resolve_dirty caller — the app runs it every frame).
+        buffer.rope_insert_at(Cursor::new(1, 0), "x");
+        buffer.set_size(Some(120.0), Some(600.0));
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let narrow_lines = buffer
+            .line_layout(&mut font_system, 0)
+            .expect("layout of line 0")
+            .len();
+        assert!(
+            narrow_lines > 1,
+            "un-edited line 0 must rewrap after resize (got {narrow_lines} layout line)"
+        );
     }
 
     #[test]
