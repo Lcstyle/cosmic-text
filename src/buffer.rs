@@ -384,8 +384,11 @@ impl LineStore {
     ///
     /// # Panics
     ///
-    /// Panics on a rope-backed store: mutation requires thawing into a full
-    /// store first, and a missed thaw must be loud rather than corrupting.
+    /// Panics on a rope-backed store. Editing reaches the rope natively
+    /// through `Buffer::rope_insert_at` / `Buffer::rope_delete_range`, and
+    /// rich-text mutation thaws first via [`Buffer::ensure_editable`]; a raw
+    /// mutating accessor reaching a rope store is external misuse and must
+    /// be loud rather than corrupting.
     fn full_mut(&mut self) -> &mut Vec<BufferLine> {
         match self {
             Self::Full(lines) => lines,
@@ -529,11 +532,17 @@ impl Buffer {
         self.max_thaw_bytes = max;
     }
 
-    /// Make the buffer mutable. A rope-backed buffer is thawed into a full
-    /// line vector (measured: ~317 ms + ~1.1 GB RSS for a 236 MB file on the
-    /// reference machine — a one-time cost on first edit). Returns false if
-    /// the store exceeds the thaw cap; the caller must treat the buffer as
-    /// read-only in that case.
+    /// Make the buffer mutable through the classic line-vector accessors. A
+    /// rope-backed buffer is thawed into a full line vector (measured:
+    /// ~317 ms + ~1.1 GB RSS for a 236 MB file on the reference machine).
+    /// Returns false if the store exceeds the thaw cap; the caller must
+    /// treat the buffer as read-only in that case.
+    ///
+    /// Plain-text editing no longer goes through this on the rope arm — the
+    /// Editor's insert/delete splice the rope natively and the cap does not
+    /// gate them. What still thaws: attrs-carrying rich-text inserts (the
+    /// per-span attrs need real [`BufferLine`]s) and any external caller
+    /// that wants the mutating accessors. The cap gates exactly those.
     pub fn ensure_editable(&mut self) -> bool {
         #[cfg(feature = "rope-buffer")]
         {
@@ -558,6 +567,79 @@ impl Buffer {
         }
         #[cfg(not(feature = "rope-buffer"))]
         true
+    }
+
+    /// Rope-native insert of plain text at `cursor`. Returns
+    /// `Some((recorded_start, end))` — the post-insert byte-true boundary
+    /// cursors: `end` is the cursor the full arm's `insert_at` would return
+    /// and becomes the caller's result; `recorded_start` goes into the
+    /// `ChangeItem` (it equals `cursor` except across a CR|LF adjacency
+    /// merge). `None` when the buffer is not rope-backed — the caller falls
+    /// through to the full path. Empty `data` must be handled by the caller
+    /// (the Editor early-returns before dispatch).
+    ///
+    /// Extends the buffer with LF lines while `cursor.line >= line_count()`,
+    /// mirroring the full arm's backfill loop. Both returned cursors
+    /// preserve the input cursor's affinity (only line/index are computed).
+    /// Sets [`DirtyFlags::TEXT_SET`] and redraw so the next shape pass
+    /// re-faults the visible region.
+    #[cfg(feature = "rope-buffer")]
+    pub(crate) fn rope_insert_at(&mut self, cursor: Cursor, data: &str) -> Option<(Cursor, Cursor)> {
+        let (start, end) = match &mut self.store {
+            LineStore::Rope(store) => {
+                // Backfill: append an LF break at end-of-text per missing
+                // line, byte-identical to the full arm's push loop (the last
+                // rope line never has an ending, so each "\n" gives the old
+                // last line an Lf break and appends a new empty last line).
+                while cursor.line >= store.line_count() {
+                    let last = store.line_count() - 1;
+                    let len = store.line_text(last).map_or(0, |text| text.len());
+                    store.insert_text(last, len, "\n");
+                }
+                store.insert_text(cursor.line, cursor.index, data)
+            }
+            LineStore::Full(_) => return None,
+        };
+        let mut recorded_start = cursor;
+        recorded_start.line = start.0;
+        recorded_start.index = start.1;
+        let mut end_cursor = cursor;
+        end_cursor.line = end.0;
+        end_cursor.index = end.1;
+        // The store did targeted invalidation; TEXT_SET makes resolve_dirty
+        // report work without clearing the caches wholesale (its rope arm
+        // skips the cache-clearing branches on TEXT_SET by design).
+        self.dirty |= DirtyFlags::TEXT_SET;
+        self.redraw = true;
+        Some((recorded_start, end_cursor))
+    }
+
+    /// Rope-native delete of `[start, end)`. Returns
+    /// `Some((recorded_start, removed))`: `recorded_start` is the
+    /// post-delete byte-true join-point cursor for the `ChangeItem` (equals
+    /// `start` except across a CR|LF adjacency merge; affinity copied from
+    /// `start`), `removed` is byte-identical to the full arm's `ChangeItem`
+    /// text. `None` when the buffer is not rope-backed. `start == end`
+    /// returns `Some((start, String::new()))` without mutating and without
+    /// setting dirty flags; otherwise sets [`DirtyFlags::TEXT_SET`] and
+    /// redraw.
+    #[cfg(feature = "rope-buffer")]
+    pub(crate) fn rope_delete_range(&mut self, start: Cursor, end: Cursor) -> Option<(Cursor, String)> {
+        let (join, removed) = match &mut self.store {
+            LineStore::Rope(store) => {
+                if start.line == end.line && start.index == end.index {
+                    return Some((start, String::new()));
+                }
+                store.delete_text(start.line, start.index, end.line, end.index)
+            }
+            LineStore::Full(_) => return None,
+        };
+        let mut recorded_start = start;
+        recorded_start.line = join.0;
+        recorded_start.index = join.1;
+        self.dirty |= DirtyFlags::TEXT_SET;
+        self.redraw = true;
+        Some((recorded_start, removed))
     }
 
     /// Number of lines in the buffer.
@@ -597,6 +679,21 @@ impl Buffer {
             LineStore::Full(lines) => lines.get(i).map(|line| Cow::Borrowed(line.text())),
             #[cfg(feature = "rope-buffer")]
             LineStore::Rope(store) => store.line_text(i),
+        }
+    }
+
+    /// Line ending of line `i`, on either storage arm, anywhere in the file
+    /// (cold rope lines included). `None` if out of bounds.
+    ///
+    /// Full: the line's stored ending. Rope: the sparse-metadata override if
+    /// set, else detected from the rope bytes. Together with
+    /// [`Buffer::line_text_cow`] this reconstructs the document byte-exactly:
+    /// `text + ending` per line ([`LineEnding::None`] contributes nothing).
+    pub fn line_ending(&self, i: usize) -> Option<LineEnding> {
+        match &self.store {
+            LineStore::Full(lines) => lines.get(i).map(BufferLine::ending),
+            #[cfg(feature = "rope-buffer")]
+            LineStore::Rope(store) => (i < store.line_count()).then(|| store.ending(i)),
         }
     }
 
@@ -1083,10 +1180,29 @@ impl Buffer {
                     line.shaping(),
                 )
             };
+            // Same shaping cap as BufferLine::shape: bound the cost for
+            // degenerate over-long lines (reachable through native editing,
+            // e.g. a giant single-line paste). The text is untouched; glyphs
+            // past the cap do not render.
+            let shape_text = if text.len() > crate::MAX_SHAPE_BYTES {
+                let mut end = crate::MAX_SHAPE_BYTES;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                #[cfg(feature = "std")]
+                log::warn!(
+                    "line is {} bytes; shaping capped at {} (text is intact, glyphs past the cap do not render)",
+                    text.len(),
+                    end
+                );
+                &text[..end]
+            } else {
+                &text[..]
+            };
             let mut shape_line = ShapeLine::empty();
             shape_line.build(
                 font_system,
-                &text,
+                shape_text,
                 &attrs_list,
                 shaping,
                 tab_width,
@@ -1343,6 +1459,15 @@ impl Buffer {
         shaping: Shaping,
         alignment: Option<Align>,
     ) {
+        // Whole-content replacement, not an edit: a rope store is demoted to
+        // a Full one (the impl rebuilds every line from scratch anyway, and
+        // the content already arrived as a &str). Invariant: set_text /
+        // set_rich_text always produce a Full store; native rope mutation
+        // always preserves the Rope store; nothing else changes the arm.
+        #[cfg(feature = "rope-buffer")]
+        if self.store_is_rope() {
+            self.store = LineStore::Full(Vec::new());
+        }
         let mut line_count = 0;
         let mut chunk_splits = 0usize;
         for (range, ending) in LineIter::new(text) {
@@ -1462,6 +1587,12 @@ impl Buffer {
     ) where
         I: IntoIterator<Item = (&'s str, Attrs<'r>)>,
     {
+        // Whole-content replacement: demote a rope store to Full, as in
+        // set_text_impl (per-span attrs are Full-only anyway).
+        #[cfg(feature = "rope-buffer")]
+        if self.store_is_rope() {
+            self.store = LineStore::Full(Vec::new());
+        }
         let mut end = 0;
         // TODO: find a way to cache this string and vec for reuse
         let (string, spans_data): (String, Vec<_>) = spans
@@ -2495,18 +2626,22 @@ mod rope_arm_tests {
         assert!(cursor.line >= 7_000, "hit cursor line {}", cursor.line);
     }
 
+    /// Phase C spec inversion of the old `thaw_on_first_edit`: a plain-text
+    /// edit is applied natively to the rope — same text and cursor as the
+    /// full arm would produce — and the store stays rope-backed.
     #[test]
-    fn thaw_on_first_edit() {
+    fn first_edit_stays_rope() {
         let buffer = rope_buffer(1_000);
         assert!(buffer.is_rope());
         let mut editor = Editor::new(buffer);
 
-        editor.insert_at(Cursor::new(500, 0), "hello ", None);
+        let cursor = editor.insert_at(Cursor::new(500, 0), "hello ", None);
 
         assert!(
-            !editor.with_buffer(|buffer| buffer.is_rope()),
-            "first edit must thaw the rope store into a full one"
+            editor.with_buffer(|buffer| buffer.is_rope()),
+            "a native edit must not thaw the rope store"
         );
+        assert_eq!(cursor, Cursor::new(500, 6));
         assert_eq!(
             editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
             Some("hello line 500 padding padding".to_string())
@@ -2515,13 +2650,19 @@ mod rope_arm_tests {
         assert_eq!(editor.with_buffer(super::Buffer::line_count), 1_001);
     }
 
+    /// The thaw cap's surviving role: it gates the rich-text insert path,
+    /// which still thaws (per-span attrs need real BufferLines).
     #[test]
-    fn thaw_cap_refuses_edit() {
+    fn thaw_cap_gates_rich_text_insert() {
         let mut buffer = rope_buffer(1_000);
         buffer.set_max_thaw_bytes(Some(10));
         let mut editor = Editor::new(buffer);
 
-        let cursor = editor.insert_at(Cursor::new(500, 0), "hello ", None);
+        let cursor = editor.insert_at(
+            Cursor::new(500, 0),
+            "hello ",
+            Some(crate::AttrsList::new(&Attrs::new())),
+        );
 
         assert_eq!(cursor, Cursor::new(500, 0), "rejected edit must be a no-op");
         assert!(
@@ -2532,6 +2673,45 @@ mod rope_arm_tests {
             editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
             Some("line 500 padding padding".to_string())
         );
+    }
+
+    /// The cap no longer gates plain-text editing: an over-cap rope buffer
+    /// accepts native inserts.
+    #[test]
+    fn over_cap_plain_edit_is_native() {
+        let mut buffer = rope_buffer(1_000);
+        buffer.set_max_thaw_bytes(Some(10));
+        let mut editor = Editor::new(buffer);
+
+        let cursor = editor.insert_at(Cursor::new(500, 0), "hello ", None);
+
+        assert_eq!(cursor, Cursor::new(500, 6));
+        assert!(
+            editor.with_buffer(|buffer| buffer.is_rope()),
+            "native edit must leave the buffer rope-backed"
+        );
+        assert_eq!(
+            editor.with_buffer(|buffer| buffer.line_text_cow(500).map(|cow| cow.into_owned())),
+            Some("hello line 500 padding padding".to_string())
+        );
+    }
+
+    /// set_text is whole-content replacement: it demotes the store to Full
+    /// instead of panicking through the mutation accessors.
+    #[test]
+    fn set_text_demotes_rope_to_full() {
+        let mut buffer = rope_buffer(10);
+        assert!(buffer.is_rope());
+
+        buffer.set_text("alpha\nbeta", &Attrs::new(), Shaping::Advanced, None);
+
+        assert!(
+            !buffer.is_rope(),
+            "set_text replaces contents wholesale and produces a Full store"
+        );
+        assert_eq!(buffer.line_count(), 2);
+        assert_eq!(buffer.line_text_cow(0).as_deref(), Some("alpha"));
+        assert_eq!(buffer.line_text_cow(1).as_deref(), Some("beta"));
     }
 
     #[test]

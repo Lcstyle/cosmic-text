@@ -288,6 +288,25 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn delete_range(&mut self, start: Cursor, end: Cursor) {
+        // Rope-native path: splice the rope directly, no thaw. The recorded
+        // start is the post-delete byte-true join point (it differs from
+        // `start` only across a CR|LF adjacency merge) so undo replays at
+        // the exact byte offset; `removed` is byte-identical to the full
+        // arm's joined ChangeItem text.
+        #[cfg(feature = "rope-buffer")]
+        if let Some((recorded_start, removed)) =
+            self.with_buffer_mut(|buffer| buffer.rope_delete_range(start, end))
+        {
+            if let Some(ref mut change) = self.change {
+                change.items.push(ChangeItem {
+                    start: recorded_start,
+                    end,
+                    text: removed,
+                    insert: false,
+                });
+            }
+            return;
+        }
         if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
             log::warn!("edit rejected: buffer exceeds the thaw cap");
             return;
@@ -378,14 +397,36 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
         data: &str,
         attrs_list: Option<AttrsList>,
     ) -> Cursor {
+        if data.is_empty() {
+            // Hoisted above the storage dispatch: an empty insert is a no-op
+            // on both arms and must neither thaw a rope store nor warn when
+            // over the cap.
+            return cursor;
+        }
+        // Rope-native path for plain text. Rich-text inserts (Some attrs)
+        // fall through: per-span attrs need real BufferLines, so they stay
+        // thaw-gated behind ensure_editable below.
+        #[cfg(feature = "rope-buffer")]
+        if attrs_list.is_none() {
+            if let Some((start, end)) =
+                self.with_buffer_mut(|buffer| buffer.rope_insert_at(cursor, data))
+            {
+                if let Some(ref mut change) = self.change {
+                    change.items.push(ChangeItem {
+                        start,
+                        end,
+                        text: data.to_string(),
+                        insert: true,
+                    });
+                }
+                return end;
+            }
+        }
         if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
             log::warn!("edit rejected: buffer exceeds the thaw cap");
             return cursor;
         }
         let mut remaining_split_len = data.len();
-        if remaining_split_len == 0 {
-            return cursor;
-        }
 
         let change_item = self.with_buffer_mut(|buffer| {
             // Save cursor for change tracking
@@ -614,10 +655,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
     }
 
     fn apply_change(&mut self, change: &Change) -> bool {
-        if !self.with_buffer_mut(|buffer| buffer.ensure_editable()) {
-            log::warn!("edit rejected: buffer exceeds the thaw cap");
-            return false;
-        }
+        // No ensure_editable pre-gate here: it would thaw a below-cap rope
+        // buffer on the first undo. Each replayed item dispatches through
+        // insert_at/delete_range (attrs_list: None ⇒ rope-native on rope;
+        // the full arm's per-op ensure_editable is a no-op true).
         // Cannot apply changes if there is a pending change
         if let Some(pending) = self.change.take() {
             if !pending.items.is_empty() {

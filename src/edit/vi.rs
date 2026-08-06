@@ -285,6 +285,19 @@ impl<'syntax_system, 'buffer> ViEditor<'syntax_system, 'buffer> {
         self.changed = false;
     }
 
+    /// Drop all undo/redo history and the save pivot, and clear `changed()`.
+    ///
+    /// For callers that replace the buffer's entire contents out-of-band
+    /// (e.g. swapping in a freshly loaded rope store): the recorded Changes
+    /// hold coordinates from the previous contents and must not survive the
+    /// swap, or a later undo would replay them against unrelated text.
+    /// `save_point()` re-pins as usual on the next save.
+    pub fn reset_history(&mut self) {
+        self.commands = cosmic_undo_2::Commands::new();
+        self.save_pivot = None;
+        self.changed = false;
+    }
+
     /// Set passthrough mode (true will turn off vi features)
     pub fn set_passthrough(&mut self, passthrough: bool) {
         if passthrough != self.passthrough {
