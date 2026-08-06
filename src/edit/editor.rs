@@ -10,9 +10,9 @@ use core::cmp;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    render_decoration, Action, Attrs, AttrsList, BorrowedWithFontSystem, BufferLine, BufferRef,
-    Change, ChangeItem, Color, Cursor, Edit, FontSystem, LayoutRun, LineEnding, LineIter, Renderer,
-    Selection, Shaping,
+    render_decoration, Action, Attrs, AttrsList, BorrowedWithFontSystem, Buffer, BufferLine,
+    BufferRef, Change, ChangeItem, Color, Cursor, Edit, FontSystem, LayoutRun, LineEnding,
+    LineIter, Renderer, Selection, Shaping,
 };
 
 /// A wrapper of [`Buffer`] for easy editing
@@ -30,6 +30,38 @@ pub struct Editor<'buffer> {
 fn cursor_position(cursor: &Cursor, run: &LayoutRun) -> Option<(i32, i32)> {
     let x = run.cursor_position(cursor)?;
     Some((x as i32, run.line_top as i32))
+}
+
+/// End cursor of a delete replay, derived by walking `text.len()` bytes from
+/// `start` over the current buffer — the exact inverse of how `delete_range`
+/// assembles a [`ChangeItem`]'s text (each line's bytes plus its own ending's
+/// bytes; [`LineEnding::None`] contributes zero, which is what display-chunk
+/// joins and a final no-newline line record).
+///
+/// Replays cannot trust the recorded end cursor: its line indices are stale
+/// whenever the recorded region was display-chunked, because undoing the
+/// delete re-inserts the recorded text as UNSPLIT lines (the chunk joins put
+/// no bytes in the record), so a later redo would address lines that no
+/// longer exist. When the buffer still matches the record's shape the walk
+/// lands exactly on the recorded end. Returns `None` if the text does not
+/// fit the buffer (divergent state) — the caller falls back to the record.
+fn derived_delete_end(buffer: &Buffer, start: Cursor, text: &str) -> Option<Cursor> {
+    let mut line_i = start.line;
+    let mut index = start.index;
+    let mut remaining = text.len();
+    loop {
+        let line_len = buffer.line_text_cow(line_i)?.len();
+        let rest = line_len.checked_sub(index)?;
+        if remaining <= rest {
+            return Some(Cursor::new(line_i, index + remaining));
+        }
+        remaining -= rest;
+        let ending_len = buffer.line_ending(line_i)?.as_str().len();
+        // A recorded region never ends inside a line ending.
+        remaining = remaining.checked_sub(ending_len)?;
+        line_i += 1;
+        index = 0;
+    }
 }
 
 /// Normalize a block selection's two corner cursors into a row range and a
@@ -674,8 +706,20 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             if item.insert {
                 self.cursor = self.insert_at(item.start, &item.text, None);
             } else {
+                // Deletes replay text-authoritatively on the full arm: see
+                // `derived_delete_end` — recorded line indices go stale when
+                // the region was display-chunked at record time. The rope arm
+                // keeps the recorded end: rope line structure is re-derived
+                // from bytes, so its recorded cursors cannot go stale, and
+                // the derivation walk would cold-read every line.
+                let end = if self.with_buffer(|buffer| buffer.is_rope()) {
+                    item.end
+                } else {
+                    self.with_buffer(|buffer| derived_delete_end(buffer, item.start, &item.text))
+                        .unwrap_or(item.end)
+                };
                 self.cursor = item.start;
-                self.delete_range(item.start, item.end);
+                self.delete_range(item.start, end);
             }
         }
         true

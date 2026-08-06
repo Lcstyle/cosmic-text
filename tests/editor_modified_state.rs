@@ -2,7 +2,9 @@
 
 use std::sync::OnceLock;
 
-use cosmic_text::{Buffer, Cursor, Edit, Metrics, SyntaxEditor, SyntaxSystem, ViEditor};
+use cosmic_text::{
+    Attrs, Buffer, Cursor, Edit, Metrics, Shaping, SyntaxEditor, SyntaxSystem, ViEditor,
+};
 
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
 
@@ -67,6 +69,61 @@ fn editor_line_endings_preserved() {
         editor.finish_change();
         assert_eq!(editor_text(&editor), "");
     }
+}
+
+// Replaying a delete whose region was display-chunked when recorded must
+// derive its end from the recorded text: undo re-inserts those bytes as
+// unsplit lines (chunk joins put no bytes in the record), so the recorded
+// end cursor's line indices no longer exist by the time redo replays the
+// delete. This is the whole-document rewrite shape a format command uses.
+#[test]
+fn redo_after_chunked_whole_document_replace() {
+    let mut editor = editor();
+
+    // One giant JSON-ish line, no newlines: set_text display-chunks it.
+    let unit = r#"{"key":"value","n":12345},"#;
+    let original: String = unit.repeat(4 * 1024); // ~104 KB, one logical line
+    editor.with_buffer_mut(|buffer| {
+        buffer.set_text(&original, &Attrs::new(), Shaping::Advanced, None);
+    });
+    let chunked_lines = editor.with_buffer(Buffer::line_count);
+    assert!(chunked_lines > 1, "the giant line must be display-chunked");
+
+    // Whole-document rewrite as ONE change record: select-all delete plus
+    // insert of the replacement.
+    let start = Cursor::new(0, 0);
+    let end = editor.with_buffer(|buffer| {
+        let last = buffer.line_count() - 1;
+        Cursor::new(
+            last,
+            buffer.line_text_cow(last).map(|t| t.len()).unwrap_or(0),
+        )
+    });
+    let replacement = "{\n  \"short\": true\n}";
+    editor.start_change();
+    editor.delete_range(start, end);
+    editor.insert_at(start, replacement, None);
+    editor.finish_change();
+    assert_eq!(editor_text(&editor), replacement);
+
+    // Undo restores the original bytes as ONE unsplit line.
+    editor.undo();
+    assert_eq!(editor_text(&editor), original);
+    assert_eq!(
+        editor.with_buffer(Buffer::line_count),
+        1,
+        "undo re-inserts the recorded bytes unsplit"
+    );
+
+    // Redo replays the recorded delete against that unsplit shape.
+    editor.redo();
+    assert_eq!(editor_text(&editor), replacement);
+
+    // And the cycle stays stable.
+    editor.undo();
+    assert_eq!(editor_text(&editor), original);
+    editor.redo();
+    assert_eq!(editor_text(&editor), replacement);
 }
 
 // Tests that inserting into an empty editor correctly sets the editor as modified.
