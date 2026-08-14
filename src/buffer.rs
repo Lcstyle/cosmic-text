@@ -246,6 +246,15 @@ impl<'b> Iterator for LayoutRunIter<'b> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(line) = self.lines.get(self.line_i) {
+            if line.hidden() {
+                // Folded away: yields no runs and no height. Checked before
+                // the shape/layout reads — hidden lines are deliberately
+                // left unshaped and must not end the iteration the way a
+                // cold visible line does.
+                self.line_i += 1;
+                self.layout_i = 0;
+                continue;
+            }
             let shape = line.shape_opt()?;
             let layout = line.layout_opt()?;
             while let Some(layout_line) = layout.get(self.layout_i) {
@@ -507,6 +516,11 @@ impl Buffer {
             } else {
                 while line_i > self.scroll.line {
                     line_i -= 1;
+                    if self.line_hidden(line_i) {
+                        // Hidden lines contribute no height between the
+                        // cursor and the scroll anchor — and need no shaping.
+                        continue;
+                    }
                     let layout = self
                         .line_layout(font_system, line_i)
                         .expect("shape_until_cursor failed to scroll forwards");
@@ -587,7 +601,12 @@ impl Buffer {
             while self.scroll.vertical < 0.0 {
                 if self.scroll.line > 0 {
                     let line_i = self.scroll.line - 1;
-                    if let Some(layout) = self.line_layout(font_system, line_i) {
+                    if self.line_hidden(line_i) {
+                        // Hidden lines have no height: step over without
+                        // consuming any of the negative offset (and without
+                        // shaping the folded-away line).
+                        self.scroll.line = line_i;
+                    } else if let Some(layout) = self.line_layout(font_system, line_i) {
                         let mut layout_height = 0.0;
                         for layout_line in layout {
                             layout_height +=
@@ -625,17 +644,28 @@ impl Buffer {
                 }
 
                 let mut layout_height = 0.0;
-                let layout = self
-                    .line_layout(font_system, line_i)
-                    .expect("shape_until_scroll invalid line");
-                for layout_line in layout {
-                    let line_height = layout_line.line_height_opt.unwrap_or(metrics.line_height);
-                    layout_height += line_height;
-                    total_height += line_height;
+                if !self.line_hidden(line_i) {
+                    let layout = self
+                        .line_layout(font_system, line_i)
+                        .expect("shape_until_scroll invalid line");
+                    for layout_line in layout {
+                        let line_height =
+                            layout_line.line_height_opt.unwrap_or(metrics.line_height);
+                        layout_height += line_height;
+                        total_height += line_height;
+                    }
                 }
 
-                // Adjust scroll.vertical to be smaller by moving scroll.line forwards
-                if line_i == self.scroll.line && layout_height <= self.scroll.vertical {
+                // Adjust scroll.vertical to be smaller by moving scroll.line
+                // forwards. Zero-height (hidden) lines advance only while
+                // offset remains to consume: advancing past them at
+                // vertical == 0.0 would re-create scroll.line > 0 after the
+                // end-of-buffer adjustment below walked it back, looping
+                // forever when the buffer starts with hidden lines.
+                if line_i == self.scroll.line
+                    && layout_height <= self.scroll.vertical
+                    && (layout_height > 0.0 || self.scroll.vertical > 0.0)
+                {
                     self.scroll.line += 1;
                     self.scroll.vertical -= layout_height;
                 }
@@ -714,6 +744,44 @@ impl Buffer {
             self.tab_width,
             self.hinting,
         ))
+    }
+
+    /// Whether line `i` is hidden (folded away from layout and rendering).
+    /// Out-of-bounds indices report false.
+    #[inline]
+    pub fn line_hidden(&self, i: usize) -> bool {
+        self.lines.get(i).is_some_and(BufferLine::hidden)
+    }
+
+    /// Set the hidden flag on line `i`. Returns true if the flag changed.
+    ///
+    /// Hidden lines keep their text and ending — reconstruction, save, copy
+    /// and every text operation still see them — but they are skipped by
+    /// layout, rendering, scroll height accounting and vertical cursor
+    /// motion. On a change the buffer is marked dirty (the scroll accounting
+    /// must re-run) and flagged for redraw; the line's own shape and layout
+    /// caches stay valid, so unhiding is cheap. Out of bounds is a no-op
+    /// returning false.
+    pub fn set_line_hidden(&mut self, i: usize, hidden: bool) -> bool {
+        let changed = match self.lines.get_mut(i) {
+            Some(line) => line.set_hidden(hidden),
+            None => false,
+        };
+        if changed {
+            // Visibility shifts the visible region exactly like a scroll
+            // change; no shape or layout cache needs invalidation.
+            self.dirty |= DirtyFlags::SCROLL;
+            self.redraw = true;
+        }
+        changed
+    }
+
+    /// Number of visible (not hidden) lines.
+    ///
+    /// The denominator for scrollbar consumers: with folds active, scroll
+    /// geometry is proportional to visible lines, not stored lines.
+    pub fn visible_line_count(&self) -> usize {
+        self.lines.iter().filter(|line| !line.hidden()).count()
     }
 
     /// Get the current [`Metrics`]
@@ -1384,9 +1452,20 @@ impl Buffer {
 
                 if layout_cursor.layout > 0 {
                     layout_cursor.layout -= 1;
-                } else if layout_cursor.line > 0 {
-                    layout_cursor.line -= 1;
-                    layout_cursor.layout = usize::MAX;
+                } else {
+                    // Land on the nearest visible line above; hidden
+                    // (folded-away) lines are not cursor targets. With no
+                    // visible line above, the cursor stays on its line —
+                    // the same behavior as pressing Up on the first line.
+                    let mut line_i = layout_cursor.line;
+                    while line_i > 0 {
+                        line_i -= 1;
+                        if !self.line_hidden(line_i) {
+                            layout_cursor.line = line_i;
+                            layout_cursor.layout = usize::MAX;
+                            break;
+                        }
+                    }
                 }
 
                 if let Some(cursor_x) = cursor_x_opt {
@@ -1413,9 +1492,19 @@ impl Buffer {
 
                 if layout_cursor.layout + 1 < layout_len {
                     layout_cursor.layout += 1;
-                } else if layout_cursor.line + 1 < self.lines.len() {
-                    layout_cursor.line += 1;
-                    layout_cursor.layout = 0;
+                } else {
+                    // Land on the nearest visible line below, skipping
+                    // hidden (folded-away) lines; with none visible below,
+                    // the cursor stays, as on the last line.
+                    let mut line_i = layout_cursor.line + 1;
+                    while line_i < self.lines.len() {
+                        if !self.line_hidden(line_i) {
+                            layout_cursor.line = line_i;
+                            layout_cursor.layout = 0;
+                            break;
+                        }
+                        line_i += 1;
+                    }
                 }
 
                 if let Some(cursor_x) = cursor_x_opt {
