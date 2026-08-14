@@ -20,6 +20,7 @@ pub struct BufferLine {
     layout_opt: Cached<Vec<LayoutLine>>,
     shaping: Shaping,
     metadata: Option<usize>,
+    hidden: bool,
 }
 
 impl BufferLine {
@@ -41,6 +42,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping,
             metadata: None,
+            hidden: false,
         }
     }
 
@@ -62,6 +64,7 @@ impl BufferLine {
         self.layout_opt.set_unused();
         self.shaping = shaping;
         self.metadata = None;
+        self.hidden = false;
     }
 
     /// Get current text
@@ -155,6 +158,34 @@ impl BufferLine {
         }
     }
 
+    /// Whether this line is hidden from layout and rendering (for example
+    /// inside a folded region). Hidden lines keep their text and line ending
+    /// — reconstruction, save, copy and every text operation still see them —
+    /// but they yield no layout runs and contribute no height.
+    pub const fn hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Set line visibility. Returns true if the value changed.
+    ///
+    /// Only the flag flips: shape and layout caches stay valid, because
+    /// hiding is a display property, not a content change — unhiding is
+    /// cheap. When the line belongs to a buffer, prefer
+    /// [`crate::Buffer::set_line_hidden`], which also marks the buffer dirty
+    /// so the next shape pass re-runs the scroll accounting.
+    ///
+    /// The flag follows the same lifecycle as alignment: preserved through
+    /// [`Self::set_text`], inherited by [`Self::split_off`], and cleared by
+    /// [`Self::reset_new`] (wholesale content replacement).
+    pub fn set_hidden(&mut self, hidden: bool) -> bool {
+        if hidden != self.hidden {
+            self.hidden = hidden;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Append line at end of this line
     ///
     /// The wrap setting of the appended line will be lost
@@ -190,6 +221,9 @@ impl BufferLine {
         // To preserve line endings, it moves to the new line
         self.ending = LineEnding::None;
         new.align = self.align;
+        // Splitting a hidden (folded-away) line leaves both halves hidden,
+        // like alignment: display properties follow the content.
+        new.hidden = self.hidden;
         new
     }
 
@@ -310,6 +344,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping: Shaping::Advanced,
             metadata: None,
+            hidden: false,
         }
     }
 
