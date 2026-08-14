@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use alloc::borrow::Cow;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
@@ -744,6 +745,66 @@ impl Buffer {
             self.tab_width,
             self.hinting,
         ))
+    }
+
+    /// Number of [`BufferLine`]s (paragraphs) in the buffer.
+    #[inline]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether the buffer holds no lines.
+    #[inline]
+    pub fn lines_is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Mutably get the line at the given index.
+    #[inline]
+    pub fn line_mut(&mut self, i: usize) -> Option<&mut BufferLine> {
+        self.lines.get_mut(i)
+    }
+
+    /// Append a line to the buffer.
+    #[inline]
+    pub fn push_line(&mut self, line: BufferLine) {
+        self.lines.push(line);
+    }
+
+    /// Shorten the buffer to `len` lines, dropping the rest.
+    #[inline]
+    pub fn truncate_lines(&mut self, len: usize) {
+        self.lines.truncate(len);
+    }
+
+    /// Iterate over the buffer's lines.
+    #[inline]
+    pub fn lines_iter(&self) -> impl Iterator<Item = &BufferLine> + '_ {
+        self.lines.iter()
+    }
+
+    /// Mutably iterate over the buffer's lines.
+    #[inline]
+    pub fn lines_iter_mut(&mut self) -> impl Iterator<Item = &mut BufferLine> + '_ {
+        self.lines.iter_mut()
+    }
+
+    /// Get the text of line `i` as borrowed [`Cow`] without copying.
+    #[inline]
+    pub fn line_text_cow(&self, i: usize) -> Option<Cow<'_, str>> {
+        self.lines.get(i).map(|line| Cow::Borrowed(line.text()))
+    }
+
+    /// Get the line ending of line `i`.
+    #[inline]
+    pub fn line_ending(&self, i: usize) -> Option<LineEnding> {
+        self.lines.get(i).map(BufferLine::ending)
+    }
+
+    /// Whether this buffer is backed by a rope store; reserved for large-file backends.
+    #[inline]
+    pub fn is_rope(&self) -> bool {
+        false
     }
 
     /// Whether line `i` is hidden (folded away from layout and rendering).
