@@ -529,6 +529,12 @@ impl Buffer {
     }
 
     /// Whether this buffer is backed by a rope store.
+    #[cfg(not(feature = "rope-buffer"))]
+    pub fn is_rope(&self) -> bool {
+        false
+    }
+
+    /// Whether this buffer is backed by a rope store.
     #[cfg(feature = "rope-buffer")]
     pub fn is_rope(&self) -> bool {
         matches!(self.store, LineStore::Rope(_))
